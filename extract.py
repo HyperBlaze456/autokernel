@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-AutoKernel Kernel Extractor -- Generate baseline Triton kernels from profiling results.
+AutoKernel Kernel Extractor -- Generate baseline kernels from profiling results.
 
 Usage:
     uv run extract.py                          # extract from workspace/profile_report.json
     uv run extract.py --top 5                  # extract only top-5 kernels
     uv run extract.py --kernel-type matmul     # extract only matmul kernels
     uv run extract.py --report path/to/report.json
+    uv run extract.py --backend cuda           # use CUDA C++ starter kernels instead of Triton
 """
 
 from __future__ import annotations
@@ -242,9 +243,16 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
 # Kernel file generation
 # ---------------------------------------------------------------------------
 
-def read_starter_kernel(op_type: str) -> Optional[str]:
-    """Read the starter kernel file from kernels/{op_type}.py. Returns None if not found."""
-    path = os.path.join(KERNELS_DIR, f"{op_type}.py")
+def read_starter_kernel(op_type: str, backend: str = "triton") -> Optional[str]:
+    """Read the starter kernel file. Returns None if not found.
+
+    For backend='triton': reads from kernels/{op_type}.py
+    For backend='cuda':   reads from kernels/cuda/{op_type}.py
+    """
+    if backend == "cuda":
+        path = os.path.join(KERNELS_DIR, "cuda", f"{op_type}.py")
+    else:
+        path = os.path.join(KERNELS_DIR, f"{op_type}.py")
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as f:
@@ -287,6 +295,7 @@ def generate_kernel_file(
     model_name: str,
     gpu_time_ms: float,
     starter_code: str,
+    backend: str = "triton",
 ) -> str:
     """Generate the complete kernel file content for extraction."""
 
@@ -324,8 +333,10 @@ def generate_kernel_file(
     lines.append('"""')
     lines.append("")
 
-    # KERNEL_TYPE
+    # KERNEL_TYPE and BACKEND
     lines.append(f'KERNEL_TYPE = "{op_type}"')
+    if backend == "cuda":
+        lines.append(f'BACKEND = "cuda"')
     lines.append("")
 
     # Model-specific shapes
@@ -362,7 +373,9 @@ def generate_kernel_file(
     # Separator
     lines.append("")
     lines.append(f"# {'=' * 70}")
-    lines.append(f"# Triton kernel code (from kernels/{op_type}.py)")
+    backend_label = "CUDA C++" if backend == "cuda" else "Triton"
+    backend_dir = f"kernels/cuda/{op_type}.py" if backend == "cuda" else f"kernels/{op_type}.py"
+    lines.append(f"# {backend_label} kernel code (from {backend_dir})")
     lines.append(f"# {'=' * 70}")
     lines.append("")
 
@@ -450,10 +463,12 @@ def extract_kernels(
     report_path: str,
     top_n: Optional[int] = None,
     kernel_type_filter: Optional[str] = None,
+    backend: str = "triton",
 ) -> None:
     """Main extraction pipeline."""
 
-    print("=== AutoKernel Kernel Extractor ===")
+    backend_label = "CUDA C++" if backend == "cuda" else "Triton"
+    print(f"=== AutoKernel Kernel Extractor ({backend_label}) ===")
     print()
 
     # -- Load profile report --
@@ -514,9 +529,10 @@ def extract_kernels(
                 model_shape = get_default_shape(op_type)
 
         # Read starter kernel
-        starter_code = read_starter_kernel(op_type)
+        starter_code = read_starter_kernel(op_type, backend=backend)
         if starter_code is None:
-            print(f"  WARNING: No starter kernel found at kernels/{op_type}.py -- skipping.")
+            starter_dir = "kernels/cuda" if backend == "cuda" else "kernels"
+            print(f"  WARNING: No starter kernel found at {starter_dir}/{op_type}.py -- skipping.")
             skipped += 1
             continue
 
@@ -535,6 +551,7 @@ def extract_kernels(
             model_name=model_name,
             gpu_time_ms=gpu_time_ms,
             starter_code=starter_code,
+            backend=backend,
         )
 
         # Write to workspace
@@ -548,7 +565,8 @@ def extract_kernels(
         print(f"  [{position}/{total}] {op_type} (rank {rank}, {pct_total}%) "
               f"-> {output_relpath}")
         print(f"        Model shape: {shape_display}")
-        print(f"        Based on: kernels/{op_type}.py")
+        starter_dir = "kernels/cuda" if backend == "cuda" else "kernels"
+        print(f"        Based on: {starter_dir}/{op_type}.py")
         print()
 
         extracted.append({
@@ -588,7 +606,7 @@ def extract_kernels(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="AutoKernel Kernel Extractor -- Generate baseline Triton kernels from profiling results.",
+        description="AutoKernel Kernel Extractor -- Generate baseline kernels from profiling results.",
     )
     parser.add_argument(
         "--report",
@@ -608,6 +626,13 @@ def main() -> None:
         default=None,
         help="Extract only kernels of this type (e.g., matmul, flash_attention)",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "cuda"],
+        default="triton",
+        help="Backend for starter kernels: 'triton' (default) or 'cuda' (native CUDA C++)",
+    )
 
     args = parser.parse_args()
 
@@ -615,6 +640,7 @@ def main() -> None:
         report_path=args.report,
         top_n=args.top,
         kernel_type_filter=args.kernel_type,
+        backend=args.backend,
     )
 
 

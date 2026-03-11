@@ -19,6 +19,14 @@ models = [
     "accelerate>=1.5.0",
     "safetensors>=0.5.0",
 ]
+# CUDA C++ backend: native CUDA kernel compilation (speeds up build from ~30s to ~5s)
+cuda = [
+    "ninja>=1.11.0",
+]
+# KernelBench integration: benchmark against 250+ standardized GPU kernel problems
+kernelbench = [
+    "datasets>=2.16.0",
+]
 
 [tool.uv.sources]
 torch = [

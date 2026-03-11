@@ -580,6 +580,152 @@ When optimizing multiple kernels in sequence, you gain cross-kernel insights:
 
 ---
 
+## CUDA C++ Optimization Playbook
+
+When using the CUDA C++ backend (`--backend cuda`), the agent edits raw CUDA C++ source
+embedded as a Python string in `kernel.py`. The `CUDA_SRC` variable contains the kernel code,
+compiled at runtime via `torch.utils.cpp_extension.load_inline()`.
+
+**The kernel contract is the same**: `kernel.py` exports `KERNEL_TYPE`, `BACKEND = "cuda"`,
+and `kernel_fn()` with the same signature. `bench.py` runs identically on either backend.
+
+### CUDA Tier 1: Thread/Block Configuration
+
+The most impactful change. Thread count and block dimensions directly control occupancy,
+register pressure, and shared memory usage.
+
+**What to try:**
+- Sweep `blockDim.x` through 128, 256, 512. More threads = better latency hiding but higher register pressure.
+- Use `dim3` for 2D/3D thread blocks when the kernel has spatial structure (e.g., matmul tiles).
+- Set `__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)` to control register allocation.
+- Calculate occupancy: `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
+
+**Typical gains**: 10-50% from finding the right thread/block config.
+
+### CUDA Tier 2: Shared Memory Tiling
+
+**Tiling strategy:**
+- Load tiles of input from global memory into `__shared__` memory.
+- Process the tile using fast shared memory reads.
+- Bank-conflict-free layout: add padding (e.g., `__shared__ float tile[32][33]` instead of `[32][32]`).
+- Double buffering: use two shared memory buffers, load next tile while computing on current.
+
+**Vectorized loads:**
+- Use `float4` for 128-bit loads (4x throughput vs scalar `float`).
+- Use `__ldg()` for read-only data through the texture cache.
+- Align memory accesses to 128 bytes for maximum coalescing.
+
+**Typical gains**: 20-40% from shared memory tiling over naive global memory access.
+
+### CUDA Tier 3: Tensor Cores
+
+**wmma API (Warp Matrix Multiply Accumulate):**
+```cpp
+#include <mma.h>
+using namespace nvcuda;
+wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+wmma::fill_fragment(c_frag, 0.0f);
+wmma::load_matrix_sync(a_frag, shared_A, ldA);
+wmma::load_matrix_sync(b_frag, shared_B, ldB);
+wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+wmma::store_matrix_sync(output, c_frag, ldC, wmma::mem_row_major);
+```
+
+- Tile sizes: 16x16x16 (fp16), 8x8x4 (tf32), 8x8x32 (int8).
+- Each warp processes one wmma tile. Assign multiple tiles per warp for ILP.
+- Keep accumulator in fp32 for numerical stability, convert to fp16 at epilogue.
+
+**Typical gains**: 2-4x over scalar code for matmul-like operations.
+
+### CUDA Tier 4: Advanced Techniques
+
+**Persistent kernels:**
+- Launch exactly `SM_COUNT` thread blocks. Each loops over multiple tiles.
+- Eliminates kernel launch overhead and improves L2 reuse.
+- Use `atomicAdd` or cooperative groups for global synchronization.
+
+**Software pipelining / cp.async (Ampere+):**
+```cpp
+// Asynchronous global -> shared memory copy
+asm volatile("cp.async.cg.shared.global [%0], [%1], %2;" :: "r"(smem_addr), "l"(gmem_addr), "n"(16));
+asm volatile("cp.async.commit_group;");
+asm volatile("cp.async.wait_group 0;");
+```
+
+**Cooperative groups:**
+- `cooperative_groups::this_grid()` for grid-level synchronization.
+- `cooperative_groups::tiled_partition<32>(block)` for warp-level primitives.
+
+**Typical gains**: 10-20% from advanced techniques.
+
+### CUDA Tier 5: Architecture-Specific
+
+**Hopper (SM90, H100):**
+- TMA (Tensor Memory Accelerator): `cp.async.bulk` for hardware-accelerated bulk copies.
+- Warp group MMA (WGMMA): next-gen tensor core with cluster-level shared memory.
+- Thread Block Clusters: cooperative thread blocks sharing distributed shared memory.
+
+**Ampere (SM80, A100):**
+- `cp.async`: async global-to-shared memory copies (non-blocking).
+- TF32 tensor cores: 19.5 TFLOPS with tf32 precision.
+- Fine-grained structured sparsity (2:4 pattern).
+
+**Ada Lovelace (SM89, RTX 4090/L40S):**
+- FP8 tensor cores for inference.
+- Smaller shared memory per SM -- use smaller tiles.
+- High FP16 throughput but consumer-grade memory bandwidth.
+
+**Typical gains**: 5-15% from arch-specific tuning.
+
+### CUDA Tier 6: Kernel-Specific Tricks
+
+**Matrix multiplication:**
+- Swizzled shared memory layout to avoid bank conflicts across warps.
+- Register-level tiling: each thread accumulates a 4x4 or 8x8 output tile.
+- Epilogue fusion: add bias, apply activation, quantize -- all in registers before writing.
+
+**Softmax:**
+- Warp-level `__shfl_xor_sync` tree reduction (5 steps for 32 threads).
+- Multi-row processing: each thread block handles multiple rows for better occupancy.
+- `__expf()` and `__fdividef()` fast math intrinsics.
+
+**LayerNorm / RMSNorm:**
+- Welford's online algorithm for single-pass mean+variance.
+- Warp shuffle cascade (`__shfl_down_sync`) for partial statistics.
+- `rsqrtf()` for fast inverse square root.
+- Vectorized `float4`/`half2` loads.
+
+**Flash Attention:**
+- Double-buffered shared memory for Q/K/V tiles.
+- Online softmax with running max and sum rescaling.
+- Causal mask with early tile termination (skip tiles where all positions are masked).
+- wmma for both Q@K^T and attn@V matmuls.
+
+**Cross Entropy:**
+- Fused online log-sum-exp: single pass for max, exp-sum, and target lookup.
+- Warp-level max + sum reductions avoid shared memory overhead.
+- `__logf()` / `__expf()` fast intrinsics.
+
+**Rotary Embeddings:**
+- `__sincosf()` for fused sin/cos computation.
+- Constant memory for precomputed frequency table.
+- Vectorized `half2` read-modify-write.
+
+### CUDA Anti-Patterns
+
+- **Warp divergence in inner loops**: All threads in a warp must take the same branch.
+- **Uncoalesced global memory access**: Threads in a warp must access consecutive addresses.
+- **Shared memory bank conflicts**: 32 banks, 4 bytes each. Pad or swizzle to avoid.
+- **Register spilling**: Too many local variables cause spills to slow local memory. Use `__launch_bounds__`.
+- **Excessive `__syncthreads()`**: Each sync stalls the entire block. Minimize sync points.
+- **Global atomics in hot paths**: Use warp-level reduction first, then one atomic per warp.
+- **Forgetting `__restrict__`**: Without it, the compiler assumes pointers may alias, blocking optimizations.
+- **Using `printf` in production kernels**: Serializes execution.
+
+---
+
 ## Decision Framework
 
 ### When to move on from a kernel
@@ -633,20 +779,36 @@ workspace/
 
 ## Supported Kernel Types
 
-The `kernels/` directory contains starter implementations:
+Two backends are available: **Triton** (default) and **CUDA C++** (`--backend cuda`).
 
 ```
-kernels/
-  matmul.py              -- matrix multiplication
-  softmax.py             -- online softmax
-  layernorm.py           -- layer normalization
-  rmsnorm.py             -- RMS normalization
-  flash_attention.py     -- flash attention (block-wise online softmax)
-  fused_mlp.py           -- fused SwiGLU MLP
-  cross_entropy.py       -- fused cross entropy loss
-  rotary_embedding.py    -- rotary position embeddings
-  reduce.py              -- parallel reduction (sum)
+kernels/                    Triton starters (Python + @triton.jit)
+  matmul.py                   -- tiled matrix multiplication
+  softmax.py                  -- row-parallel online softmax
+  layernorm.py                -- layer normalization
+  rmsnorm.py                  -- RMS normalization
+  flash_attention.py          -- flash attention (block-wise online softmax)
+  fused_mlp.py                -- fused SwiGLU MLP
+  cross_entropy.py            -- fused cross entropy loss
+  rotary_embedding.py         -- rotary position embeddings
+  reduce.py                   -- parallel reduction (sum)
+
+kernels/cuda/               CUDA C++ starters (tensor core accelerated)
+  _compile.py                 -- shared compilation utility (load_inline + caching)
+  matmul.py                   -- wmma tensor core GEMM, double-buffered shared memory
+  softmax.py                  -- warp shuffle reduction, __expf fast math
+  layernorm.py                -- Welford's online algorithm, vectorized float4 loads
+  rmsnorm.py                  -- single-pass RMS, warp shuffle cascade
+  flash_attention.py          -- tiled online softmax, causal mask, SRAM blocking
+  fused_mlp.py                -- fused gate+up+silu, shared memory tiling
+  cross_entropy.py            -- online log-sum-exp + NLL, warp reductions
+  rotary_embedding.py         -- __sincosf intrinsic, vectorized half2
+  reduce.py                   -- hierarchical warp shuffle + shared memory
 ```
+
+Both backends export the same `KERNEL_TYPE` and `kernel_fn()` interface. `bench.py` runs
+identically regardless of backend. Choose Triton for fast iteration, CUDA C++ for maximum
+performance (direct tensor core access, PTX intrinsics, bank-conflict-free layouts).
 
 ---
 
