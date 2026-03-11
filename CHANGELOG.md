@@ -1,0 +1,62 @@
+# Changelog
+
+## v1.1.0 -- 2026-03-12
+
+### Native CUDA C++ Backend
+
+- Added 9 CUDA C++ starter kernels with advanced GPU features:
+  - **matmul** -- Tensor core GEMM via `wmma` API, 128x128 tiles, double-buffered shared memory
+  - **softmax** -- Warp shuffle reductions, `half2` vectorized loads, grid-stride loop
+  - **layernorm** -- Welford's single-pass algorithm, `float4` vectorized loads, warp shuffle stats
+  - **rmsnorm** -- Warp shuffle cascade, `rsqrtf` fast inverse sqrt, `half2` vectorization
+  - **flash_attention** -- Tiled online softmax, double-buffered shared memory, causal mask support
+  - **fused_mlp** -- Fused SwiGLU (gate + up + SiLU + mul), shared memory tiling
+  - **cross_entropy** -- Fused online log-sum-exp + NLL in single pass, warp reductions
+  - **rotary_embedding** -- `__sincosf` intrinsic, `half2` read-modify-write
+  - **reduce** -- Hierarchical warp shuffle + shared memory + grid-level atomic
+- Added `kernels/cuda/_compile.py` -- shared compilation utility:
+  - Hash-based caching (recompile only when source changes)
+  - GPU architecture auto-detection via `torch.cuda.get_device_capability()`
+  - Forward declaration extraction for cross-translation-unit linking
+  - Thread-safe compilation with file locking
+  - Detailed error diagnostics with source line numbers
+- Added `--backend triton|cuda` flag to `extract.py`
+- Added CUDA C++ optimization playbook to `program.md`
+- Added `ninja` as optional dependency for faster compilation
+
+### KernelBench Integration
+
+- Added `kernelbench/bridge.py` -- problem loader supporting 3 sources:
+  - HuggingFace datasets (`--source hf`)
+  - Local KernelBench repo clone (`--source local`)
+  - Individual Python files (`--source file`)
+  - Automatic problem analysis (50+ operation patterns)
+  - Starter `ModelNew` generation with CUDA/Triton templates
+- Added `kernelbench/bench_kb.py` -- 4-stage evaluation pipeline:
+  - Stage 1: Correctness (5 random input trials, atol/rtol=1e-2)
+  - Stage 2: Stability (NaN/Inf detection)
+  - Stage 3: Determinism (3 identical runs)
+  - Stage 4: Performance (CUDA event timing, trimmed median)
+  - Greppable output with `fast_p` at 7 thresholds
+- Added `kernelbench/scorer.py` -- batch evaluation and metrics:
+  - `fast_p` metric at thresholds: 1.0x, 1.1x, 1.25x, 1.5x, 2.0x, 3.0x, 5.0x
+  - Incremental scoring with JSON persistence
+  - Leaderboard-style reports with progress bars
+- Added `kernelbench/program_kb.md` -- agent instructions for KernelBench mode:
+  - Optimization playbook per difficulty level (L1-L4)
+  - CUDA C++ and Triton strategy examples
+  - Decision framework and anti-patterns
+
+### Other
+
+- Updated README with KernelBench section, dual-backend docs, and Discord link
+- Added `datasets>=2.16.0` as optional `kernelbench` dependency
+
+## v1.0.0 -- Initial Release
+
+- Triton kernel optimization pipeline (profile, extract, bench, orchestrate, verify)
+- 9 starter Triton kernels (matmul, softmax, layernorm, rmsnorm, flash_attention, fused_mlp, cross_entropy, rotary_embedding, reduce)
+- 5-stage correctness harness + roofline analysis
+- Amdahl's law orchestration for multi-kernel optimization
+- Self-contained model definitions (GPT-2, LLaMA, BERT)
+- TSV logging and experiment visualization
