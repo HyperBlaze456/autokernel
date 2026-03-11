@@ -99,7 +99,7 @@ def verify_environment() -> None:
     device = torch.cuda.current_device()
     gpu_name = torch.cuda.get_device_name(device)
     props = torch.cuda.get_device_properties(device)
-    mem_gb = props.total_mem / (1024 ** 3)
+    mem_gb = props.total_memory / (1024 ** 3)
     sm_count = props.multi_processor_count
     cc_major = props.major
     cc_minor = props.minor

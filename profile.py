@@ -92,7 +92,7 @@ def _fallback_detect_gpu() -> GPUSpec:
     props = torch.cuda.get_device_properties(0)
     name = props.name
     sm_count = props.multi_processor_count
-    memory_gb = round(props.total_mem / (1024 ** 3), 1)
+    memory_gb = round(props.total_memory / (1024 ** 3), 1)
     cc = (props.major, props.minor)
 
     # Known GPUs: name_fragment -> (peak_fp16_tflops, peak_bandwidth_gb_s, l2_cache_mb)
@@ -390,7 +390,7 @@ def _prepare_model_and_input(
             if attempt_batch == 1:
                 raise RuntimeError(
                     "Model does not fit in GPU memory even with batch_size=1. "
-                    f"GPU memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB"
+                    f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
                 )
             print(
                 f"  OOM with batch_size={attempt_batch}, trying smaller..."

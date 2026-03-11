@@ -126,7 +126,7 @@ def detect_gpu() -> GPUSpec:
     props = torch.cuda.get_device_properties(0)
     name = props.name
     sm_count = props.multi_processor_count
-    memory_gb = round(props.total_mem / (1024 ** 3), 1)
+    memory_gb = round(props.total_memory / (1024 ** 3), 1)
     cc = (props.major, props.minor)
 
     # Try to match a known GPU
