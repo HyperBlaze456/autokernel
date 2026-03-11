@@ -25,7 +25,6 @@ run.log
 
 # Analysis output (regenerated)
 report.md
-progress.png
 
 # Workspace (runtime artifacts)
 workspace/
