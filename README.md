@@ -212,6 +212,14 @@ This project is **autoresearch for GPU kernels** -- directly inspired by Andrej 
 
 Built by the team behind [Forge](https://www.rightnowai.co/forge).
 
+## Community
+
+Join our Discord to discuss GPU kernel optimization, share results, and get help:
+
+[![Discord](https://img.shields.io/discord/1234567890?color=5865F2&logo=discord&logoColor=white)](https://discord.com/invite/sSJqgNnq6X)
+
+**[Join the AutoKernel Discord](https://discord.com/invite/sSJqgNnq6X)**
+
 ## License
 
 MIT
