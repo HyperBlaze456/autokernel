@@ -14,6 +14,7 @@ Current scope:
 - run-to-run comparison for agent-driven optimisation loops
 - remote TPU tunnel instructions
 - heuristic diagnosis for deciding whether to stay in JAX/XLA or escalate to Pallas
+- TPU hardware specs (v4, v6e) with roofline analysis and MXU utilization estimation
 - lazy JAX import so the module remains importable on non-JAX environments
 """
 
@@ -28,7 +29,8 @@ import pathlib
 import statistics
 import sys
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -40,6 +42,198 @@ DEFAULT_PERFETTO_PORT = 9001
 DEFAULT_XPROF_PORT = 8791
 DEFAULT_WARMUP_ITERS = 3
 DEFAULT_MEASURE_ITERS = 10
+
+
+# =========================================================================
+# TPU Hardware Specifications
+# =========================================================================
+
+@dataclass
+class TPUSpec:
+    """Hardware specification for a TPU generation."""
+
+    name: str
+    generation: str
+    peak_tflops_bf16: float
+    peak_tflops_fp32: float
+    hbm_bandwidth_gb_s: float
+    vmem_mib_per_core: float
+    smem_kib_per_core: float
+    mxu_shape: Tuple[int, int]
+    cores_per_chip: int
+
+
+_KNOWN_TPUS: Dict[str, TPUSpec] = {
+    "v4": TPUSpec(
+        name="TPU v4",
+        generation="v4",
+        peak_tflops_bf16=275.0,
+        peak_tflops_fp32=137.5,
+        hbm_bandwidth_gb_s=1200.0,
+        vmem_mib_per_core=32.0,
+        smem_kib_per_core=16.0,
+        mxu_shape=(128, 128),
+        cores_per_chip=2,
+    ),
+    "v5e": TPUSpec(
+        name="TPU v5e",
+        generation="v5e",
+        peak_tflops_bf16=197.0,
+        peak_tflops_fp32=98.5,
+        hbm_bandwidth_gb_s=800.0,
+        vmem_mib_per_core=128.0,
+        smem_kib_per_core=16.0,
+        mxu_shape=(128, 128),
+        cores_per_chip=1,
+    ),
+    "v5p": TPUSpec(
+        name="TPU v5p",
+        generation="v5p",
+        peak_tflops_bf16=459.0,
+        peak_tflops_fp32=229.5,
+        hbm_bandwidth_gb_s=2765.0,
+        vmem_mib_per_core=64.0,
+        smem_kib_per_core=32.0,
+        mxu_shape=(128, 128),
+        cores_per_chip=2,
+    ),
+    "v6e": TPUSpec(
+        name="TPU v6e (Trillium)",
+        generation="v6e",
+        peak_tflops_bf16=918.0,
+        peak_tflops_fp32=459.0,
+        hbm_bandwidth_gb_s=1640.0,
+        vmem_mib_per_core=64.0,
+        smem_kib_per_core=64.0,
+        mxu_shape=(256, 256),
+        cores_per_chip=1,
+    ),
+}
+
+
+def get_tpu_spec(generation: Optional[str] = None) -> TPUSpec:
+    """Look up a TPU spec by generation string (e.g. ``'v4'``, ``'v6e'``).
+
+    If *generation* is ``None``, attempt auto-detection via JAX device
+    metadata.  Raises :class:`KeyError` if the generation is unknown.
+    """
+    if generation is not None:
+        gen = generation.lower().replace("tpu", "").strip()
+        if gen in _KNOWN_TPUS:
+            return _KNOWN_TPUS[gen]
+        raise KeyError(
+            f"Unknown TPU generation '{generation}'. Available: {list(_KNOWN_TPUS.keys())}"
+        )
+
+    # Auto-detect from JAX
+    try:
+        jax = _import_jax()
+        devices = jax.devices()
+        if devices and str(devices[0].platform) == "tpu":
+            device_kind = str(getattr(devices[0], "device_kind", "")).lower()
+            for gen_key in _KNOWN_TPUS:
+                if gen_key in device_kind:
+                    return _KNOWN_TPUS[gen_key]
+    except Exception:
+        pass
+
+    raise KeyError(
+        "Could not auto-detect TPU generation. Specify explicitly: get_tpu_spec('v4')"
+    )
+
+
+def compute_roofline(
+    flops: int,
+    bytes_accessed: int,
+    spec: TPUSpec,
+    measured_latency_ms: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Roofline analysis for a given operation on a TPU.
+
+    Returns arithmetic intensity, ridge point, bottleneck classification,
+    and the attainable performance ceiling.  When *measured_latency_ms* is
+    provided, also returns achieved throughput and percentage-of-peak metrics.
+    """
+    if bytes_accessed <= 0:
+        return {
+            "arithmetic_intensity": float("inf"),
+            "ridge_point": 0.0,
+            "bottleneck": "compute_bound",
+            "attainable_tflops": spec.peak_tflops_bf16,
+            "pct_peak_compute": 0.0,
+            "pct_peak_bandwidth": 0.0,
+        }
+
+    arithmetic_intensity = flops / bytes_accessed  # FLOP/byte
+    ridge_point = (spec.peak_tflops_bf16 * 1e12) / (spec.hbm_bandwidth_gb_s * 1e9)
+
+    if arithmetic_intensity < ridge_point:
+        bottleneck = "memory_bound"
+        attainable_tflops = arithmetic_intensity * spec.hbm_bandwidth_gb_s * 1e9 / 1e12
+    else:
+        bottleneck = "compute_bound"
+        attainable_tflops = spec.peak_tflops_bf16
+
+    result: Dict[str, Any] = {
+        "arithmetic_intensity": round(arithmetic_intensity, 4),
+        "ridge_point": round(ridge_point, 4),
+        "bottleneck": bottleneck,
+        "attainable_tflops": round(attainable_tflops, 3),
+    }
+
+    if measured_latency_ms is not None and measured_latency_ms > 0:
+        measured_tflops = flops / (measured_latency_ms / 1000.0) / 1e12
+        measured_bw = bytes_accessed / (measured_latency_ms / 1000.0) / 1e9
+        result["measured_tflops"] = round(measured_tflops, 3)
+        result["measured_bandwidth_gb_s"] = round(measured_bw, 1)
+        result["pct_peak_compute"] = round(
+            measured_tflops / spec.peak_tflops_bf16 * 100.0, 2
+        )
+        result["pct_peak_bandwidth"] = round(
+            measured_bw / spec.hbm_bandwidth_gb_s * 100.0, 2
+        )
+
+    return result
+
+
+def estimate_mxu_utilization(
+    m: int, n: int, k: int, spec: TPUSpec,
+) -> Dict[str, Any]:
+    """Estimate MXU utilization for a matmul ``[M,K] x [K,N]``.
+
+    The MXU processes tiles of *mxu_shape* each cycle.  Undersized
+    dimensions waste lanes.  Returns utilization fraction, tile counts,
+    and a flag indicating GEMV-like (under-saturated) workloads -- the
+    exact pattern Henry Ko identified in the NSA single-query bottleneck.
+    """
+    mxu_m, mxu_n = spec.mxu_shape
+
+    m_util = min(m, mxu_m) / mxu_m
+    n_util = min(n, mxu_n) / mxu_n
+    utilization = m_util * n_util
+
+    m_tiles = math.ceil(m / mxu_m)
+    n_tiles = math.ceil(n / mxu_n)
+    k_tiles = math.ceil(k / mxu_m)
+
+    padded_m = m_tiles * mxu_m
+    padded_n = n_tiles * mxu_n
+    padding_waste = (
+        1.0 - (m * n) / (padded_m * padded_n)
+        if padded_m * padded_n > 0
+        else 0.0
+    )
+
+    return {
+        "mxu_utilization": round(utilization, 4),
+        "m_utilization": round(m_util, 4),
+        "n_utilization": round(n_util, 4),
+        "m_tiles": m_tiles,
+        "n_tiles": n_tiles,
+        "k_tiles": k_tiles,
+        "padding_waste": round(padding_waste, 4),
+        "is_gemv_like": m < mxu_m or n < mxu_n,
+    }
 
 
 def _percentile(values: List[float], pct: float) -> float:

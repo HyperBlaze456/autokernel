@@ -556,5 +556,223 @@ class ProfileJaxTests(unittest.TestCase):
         self.assertIn("diagnosis", result)
 
 
+    # --- TPU spec lookup tests ---
+
+    def test_get_tpu_spec_v4(self):
+        spec = self.mod.get_tpu_spec("v4")
+        self.assertEqual(spec.generation, "v4")
+        self.assertAlmostEqual(spec.peak_tflops_bf16, 275.0)
+        self.assertAlmostEqual(spec.hbm_bandwidth_gb_s, 1200.0)
+        self.assertEqual(spec.mxu_shape, (128, 128))
+        self.assertEqual(spec.cores_per_chip, 2)
+        self.assertAlmostEqual(spec.vmem_mib_per_core, 32.0)
+        self.assertAlmostEqual(spec.smem_kib_per_core, 16.0)
+
+    def test_get_tpu_spec_v6e(self):
+        spec = self.mod.get_tpu_spec("v6e")
+        self.assertEqual(spec.generation, "v6e")
+        self.assertAlmostEqual(spec.peak_tflops_bf16, 918.0)
+        self.assertAlmostEqual(spec.hbm_bandwidth_gb_s, 1640.0)
+        self.assertEqual(spec.mxu_shape, (256, 256))
+        self.assertAlmostEqual(spec.vmem_mib_per_core, 64.0)
+        self.assertAlmostEqual(spec.smem_kib_per_core, 64.0)
+
+    def test_get_tpu_spec_v5e(self):
+        spec = self.mod.get_tpu_spec("v5e")
+        self.assertEqual(spec.generation, "v5e")
+        self.assertAlmostEqual(spec.peak_tflops_bf16, 197.0)
+        self.assertAlmostEqual(spec.hbm_bandwidth_gb_s, 800.0)
+        self.assertEqual(spec.mxu_shape, (128, 128))
+        self.assertEqual(spec.cores_per_chip, 1)
+        self.assertAlmostEqual(spec.vmem_mib_per_core, 128.0)
+
+    def test_get_tpu_spec_v5p(self):
+        spec = self.mod.get_tpu_spec("v5p")
+        self.assertEqual(spec.generation, "v5p")
+        self.assertAlmostEqual(spec.peak_tflops_bf16, 459.0)
+        self.assertAlmostEqual(spec.hbm_bandwidth_gb_s, 2765.0)
+        self.assertEqual(spec.mxu_shape, (128, 128))
+        self.assertEqual(spec.cores_per_chip, 2)
+
+    def test_get_tpu_spec_v6e_single_core(self):
+        """v6e has 1 TensorCore per chip (256x256 MXU)."""
+        spec = self.mod.get_tpu_spec("v6e")
+        self.assertEqual(spec.cores_per_chip, 1)
+
+    def test_get_tpu_spec_case_insensitive(self):
+        spec = self.mod.get_tpu_spec("V4")
+        self.assertEqual(spec.generation, "v4")
+        spec2 = self.mod.get_tpu_spec("TPU v6e")
+        self.assertEqual(spec2.generation, "v6e")
+
+    def test_get_tpu_spec_unknown_raises(self):
+        with self.assertRaises(KeyError):
+            self.mod.get_tpu_spec("v99")
+
+    # --- Roofline analysis tests ---
+
+    def test_compute_roofline_memory_bound(self):
+        """Low arithmetic intensity (softmax-like) → memory bound."""
+        spec = self.mod.get_tpu_spec("v4")
+        # AI = 5M / 4M = 1.25 FLOP/byte
+        # ridge point = 275e12 / 1200e9 ≈ 229.17
+        result = self.mod.compute_roofline(
+            flops=5_000_000, bytes_accessed=4_000_000, spec=spec,
+        )
+        self.assertEqual(result["bottleneck"], "memory_bound")
+        self.assertAlmostEqual(result["arithmetic_intensity"], 1.25, places=2)
+        self.assertGreater(result["ridge_point"], 200.0)
+
+    def test_compute_roofline_compute_bound(self):
+        """Large matmul → compute bound."""
+        spec = self.mod.get_tpu_spec("v4")
+        M, N, K = 4096, 4096, 4096
+        flops = 2 * M * N * K
+        bytes_accessed = (M * K + K * N + M * N) * 2  # bf16
+        result = self.mod.compute_roofline(
+            flops=flops, bytes_accessed=bytes_accessed, spec=spec,
+        )
+        self.assertEqual(result["bottleneck"], "compute_bound")
+        self.assertGreater(result["arithmetic_intensity"], result["ridge_point"])
+
+    def test_compute_roofline_attainable_memory_bound(self):
+        """Memory-bound attainable TFLOPS = AI * bandwidth."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.compute_roofline(
+            flops=1_000_000, bytes_accessed=1_000_000, spec=spec,
+        )
+        # AI = 1.0, attainable = 1.0 * 1200 GB/s = 1.2 TFLOPS
+        self.assertAlmostEqual(result["attainable_tflops"], 1.2, places=1)
+
+    def test_compute_roofline_attainable_compute_bound(self):
+        """Compute-bound attainable TFLOPS = peak."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.compute_roofline(
+            flops=1_000_000_000, bytes_accessed=1, spec=spec,
+        )
+        self.assertAlmostEqual(result["attainable_tflops"], 275.0)
+
+    def test_compute_roofline_with_measured_latency(self):
+        """Measured latency produces throughput and pct-of-peak fields."""
+        spec = self.mod.get_tpu_spec("v4")
+        flops = 2 * 4096 * 4096 * 4096  # ~137.4 GFLOP
+        bytes_accessed = (4096 * 4096 * 3) * 2
+        result = self.mod.compute_roofline(
+            flops=flops, bytes_accessed=bytes_accessed, spec=spec,
+            measured_latency_ms=1.0,
+        )
+        self.assertIn("measured_tflops", result)
+        self.assertIn("pct_peak_compute", result)
+        self.assertIn("measured_bandwidth_gb_s", result)
+        self.assertIn("pct_peak_bandwidth", result)
+        # 137.4 GFLOP in 1ms = 137.4 TFLOPS
+        self.assertGreater(result["measured_tflops"], 100.0)
+        self.assertGreater(result["pct_peak_compute"], 0.0)
+
+    def test_compute_roofline_no_measured_fields_without_latency(self):
+        """Without measured_latency_ms, measured_* fields should be absent."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.compute_roofline(
+            flops=1000, bytes_accessed=1000, spec=spec,
+        )
+        self.assertNotIn("measured_tflops", result)
+        self.assertNotIn("pct_peak_compute", result)
+
+    def test_compute_roofline_zero_bytes(self):
+        """Zero bytes → compute bound with inf arithmetic intensity."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.compute_roofline(flops=1000, bytes_accessed=0, spec=spec)
+        self.assertEqual(result["bottleneck"], "compute_bound")
+        self.assertEqual(result["arithmetic_intensity"], float("inf"))
+
+    def test_compute_roofline_v6e_higher_ridge_point(self):
+        """v6e has different ridge point than v4 due to different peak/bw ratio."""
+        v4 = self.mod.get_tpu_spec("v4")
+        v6e = self.mod.get_tpu_spec("v6e")
+        r_v4 = self.mod.compute_roofline(flops=1000, bytes_accessed=100, spec=v4)
+        r_v6e = self.mod.compute_roofline(flops=1000, bytes_accessed=100, spec=v6e)
+        # v6e: 918/1640 ≈ 560, v4: 275/1200 ≈ 229
+        self.assertGreater(r_v6e["ridge_point"], r_v4["ridge_point"])
+
+    def test_compute_roofline_v5p_high_bandwidth(self):
+        """v5p's high HBM bandwidth (2765 GB/s) lowers the ridge point."""
+        v5p = self.mod.get_tpu_spec("v5p")
+        v6e = self.mod.get_tpu_spec("v6e")
+        r_v5p = self.mod.compute_roofline(flops=1000, bytes_accessed=100, spec=v5p)
+        r_v6e = self.mod.compute_roofline(flops=1000, bytes_accessed=100, spec=v6e)
+        # v5p: 459/2765 ≈ 166, v6e: 918/1640 ≈ 560
+        # v5p ridge point is lower → more ops become compute-bound on v5p
+        self.assertLess(r_v5p["ridge_point"], r_v6e["ridge_point"])
+
+    def test_compute_roofline_same_op_different_bottleneck(self):
+        """An op can be memory-bound on v6e but compute-bound on v5p."""
+        v5p = self.mod.get_tpu_spec("v5p")
+        v6e = self.mod.get_tpu_spec("v6e")
+        # AI = 200 FLOP/byte: below v6e ridge (~560) but above v5p ridge (~166)
+        r_v5p = self.mod.compute_roofline(flops=200_000, bytes_accessed=1000, spec=v5p)
+        r_v6e = self.mod.compute_roofline(flops=200_000, bytes_accessed=1000, spec=v6e)
+        self.assertEqual(r_v5p["bottleneck"], "compute_bound")
+        self.assertEqual(r_v6e["bottleneck"], "memory_bound")
+
+    # --- MXU utilization tests ---
+
+    def test_estimate_mxu_full_utilization_v4(self):
+        """128x128 matmul on v4 (128x128 MXU) → 100% utilization."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.estimate_mxu_utilization(128, 128, 128, spec)
+        self.assertAlmostEqual(result["mxu_utilization"], 1.0)
+        self.assertFalse(result["is_gemv_like"])
+        self.assertAlmostEqual(result["padding_waste"], 0.0)
+
+    def test_estimate_mxu_gemv_like_v4(self):
+        """[16,128] x [128,128] on v4 → 12.5% utilization (NSA single-query pattern)."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.estimate_mxu_utilization(16, 128, 128, spec)
+        self.assertAlmostEqual(result["mxu_utilization"], 16 / 128)
+        self.assertTrue(result["is_gemv_like"])
+        self.assertAlmostEqual(result["m_utilization"], 16 / 128)
+        self.assertAlmostEqual(result["n_utilization"], 1.0)
+
+    def test_estimate_mxu_oversized_capped(self):
+        """Matmul larger than MXU → utilization capped at 100%."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.estimate_mxu_utilization(256, 256, 256, spec)
+        self.assertAlmostEqual(result["mxu_utilization"], 1.0)
+        self.assertFalse(result["is_gemv_like"])
+        self.assertEqual(result["m_tiles"], 2)
+        self.assertEqual(result["n_tiles"], 2)
+
+    def test_estimate_mxu_v6e_larger_mxu(self):
+        """128x128 matmul on v6e (256x256 MXU) → 25% utilization."""
+        spec = self.mod.get_tpu_spec("v6e")
+        result = self.mod.estimate_mxu_utilization(128, 128, 128, spec)
+        self.assertAlmostEqual(result["mxu_utilization"], 0.25)
+        self.assertTrue(result["is_gemv_like"])
+
+    def test_estimate_mxu_v6e_full(self):
+        """256x256 matmul on v6e (256x256 MXU) → 100%."""
+        spec = self.mod.get_tpu_spec("v6e")
+        result = self.mod.estimate_mxu_utilization(256, 256, 256, spec)
+        self.assertAlmostEqual(result["mxu_utilization"], 1.0)
+        self.assertFalse(result["is_gemv_like"])
+
+    def test_estimate_mxu_padding_waste(self):
+        """Non-aligned dimensions → padding waste > 0."""
+        spec = self.mod.get_tpu_spec("v4")
+        # 100x100 on 128x128 MXU: padded to 128x128, waste = 1 - (10000/16384)
+        result = self.mod.estimate_mxu_utilization(100, 100, 128, spec)
+        expected_waste = 1.0 - (100 * 100) / (128 * 128)
+        self.assertAlmostEqual(result["padding_waste"], round(expected_waste, 4))
+        self.assertTrue(result["is_gemv_like"])
+
+    def test_estimate_mxu_tile_counts(self):
+        """Verify tile count computation."""
+        spec = self.mod.get_tpu_spec("v4")
+        result = self.mod.estimate_mxu_utilization(300, 500, 200, spec)
+        self.assertEqual(result["m_tiles"], 3)   # ceil(300/128)
+        self.assertEqual(result["n_tiles"], 4)   # ceil(500/128)
+        self.assertEqual(result["k_tiles"], 2)   # ceil(200/128)
+
+
 if __name__ == "__main__":
     unittest.main()
