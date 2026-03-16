@@ -559,7 +559,7 @@ def _run_timed_callable(fn: Callable[[], Any], measure_iters: int, warmup_iters:
 
     # 3. Measure steady-state latencies
     warm_latencies = []
-    for _ in range(max(1, measure_iters)):
+    for _ in range(max(0, measure_iters)):
         t1 = time.perf_counter()
         out = fn()
         if hasattr(out, "block_until_ready"):

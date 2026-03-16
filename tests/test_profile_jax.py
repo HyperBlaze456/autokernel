@@ -15,6 +15,8 @@ class ProfileJaxTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("profile_jax", MODULE_PATH)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
+        import sys
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         cls.mod = module
 
@@ -177,6 +179,24 @@ class ProfileJaxTests(unittest.TestCase):
         # 1 cold + 0 warmup + 5 measure = 6
         self.assertEqual(call_count[0], 6)
         self.assertEqual(result["measure_iters"], 5)
+
+    def test_run_timed_callable_zero_measure_iters(self):
+        """measure_iters=0 should not force an extra warm measurement."""
+        call_count = [0]
+
+        def fake_fn():
+            call_count[0] += 1
+            return None
+
+        fake_jax = mock.MagicMock()
+        fake_jax.devices.return_value = []
+
+        with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax):
+            result = self.mod._run_timed_callable(fake_fn, measure_iters=0, warmup_iters=0)
+
+        self.assertEqual(call_count[0], 1)
+        self.assertEqual(result["measure_iters"], 0)
+        self.assertAlmostEqual(result["warm_latency_ms_mean"], 0.0)
 
     # --- Trace artifact collection tests ---
 
