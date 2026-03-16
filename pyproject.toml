@@ -31,6 +31,11 @@ kernelbench = [
 profiling = [
     "HolisticTraceAnalysis>=0.2.0",
 ]
+# JAX/TPU profiling: Perfetto + XProf oriented workflow for TPU/Pallas research
+jax-profiling = [
+    "jax>=0.5.0",
+    "xprof>=2.19.0",
+]
 # HuggingFace Kernels: export and distribute optimized kernels via the Hub
 hf-kernels = [
     "kernels>=0.4.0",
