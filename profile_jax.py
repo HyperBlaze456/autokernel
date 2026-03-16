@@ -9,6 +9,9 @@ user should inspect raw traces manually.
 Current scope:
 - programmatic or server/manual capture modes
 - cold vs warm timing summaries
+- TraceRegion / RegionTracker for annotated region instrumentation
+- device and platform metadata collection
+- run-to-run comparison for agent-driven optimisation loops
 - remote TPU tunnel instructions
 - heuristic diagnosis for deciding whether to stay in JAX/XLA or escalate to Pallas
 - lazy JAX import so the module remains importable on non-JAX environments
@@ -54,6 +57,85 @@ def _percentile(values: List[float], pct: float) -> float:
     return ordered[low] * (1.0 - weight) + ordered[high] * weight
 
 
+class RegionTracker:
+    """Accumulates wall-clock timing data for annotated trace regions.
+
+    Use with TraceRegion context managers to build up a region-level breakdown
+    that feeds into heuristic_diagnosis and the benchmark_summary JSON.
+    """
+
+    def __init__(self) -> None:
+        self._regions: List[Dict[str, Any]] = []
+        self._total_ms: float = 0.0
+
+    def record(self, name: str, elapsed_ms: float, **metadata: Any) -> None:
+        entry: Dict[str, Any] = {"name": name, "elapsed_ms": round(elapsed_ms, 3)}
+        entry.update(metadata)
+        self._regions.append(entry)
+        self._total_ms += elapsed_ms
+
+    def region(self, name: str, **metadata: Any) -> "TraceRegion":
+        """Convenience: return a TraceRegion bound to this tracker."""
+        return TraceRegion(name, tracker=self, **metadata)
+
+    def summarize(self) -> List[Dict[str, Any]]:
+        """Return regions sorted by elapsed time desc, each with a pct field."""
+        result = []
+        for r in self._regions:
+            entry = dict(r)
+            entry["pct"] = round(r["elapsed_ms"] / self._total_ms * 100.0, 2) if self._total_ms > 0 else 0.0
+            result.append(entry)
+        return sorted(result, key=lambda x: x["elapsed_ms"], reverse=True)
+
+    def reset(self) -> None:
+        self._regions.clear()
+        self._total_ms = 0.0
+
+
+class TraceRegion:
+    """Context manager wrapping jax.profiler.TraceAnnotation with wall-clock timing.
+
+    When used with a RegionTracker, the elapsed time and metadata are
+    automatically recorded on exit.  Works even when JAX is not installed
+    (the annotation is simply skipped).
+
+    Usage::
+
+        tracker = RegionTracker()
+        with TraceRegion("attention", tracker=tracker):
+            result = attention_fn(q, k, v)
+    """
+
+    def __init__(self, name: str, *, tracker: Optional[RegionTracker] = None, **metadata: Any) -> None:
+        self.name = name
+        self.tracker = tracker
+        self.metadata = metadata
+        self._annotation: Any = None
+        self._start_ns: int = 0
+        self.elapsed_ms: float = 0.0
+
+    def __enter__(self) -> "TraceRegion":
+        try:
+            jax = _import_jax()
+            self._annotation = jax.profiler.TraceAnnotation(self.name)
+            self._annotation.__enter__()
+        except Exception:
+            self._annotation = None
+        self._start_ns = time.perf_counter_ns()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        self.elapsed_ms = (time.perf_counter_ns() - self._start_ns) / 1e6
+        if self._annotation is not None:
+            try:
+                self._annotation.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
+        if self.tracker is not None:
+            self.tracker.record(self.name, self.elapsed_ms, **self.metadata)
+        return False
+
+
 def summarize_timings(cold_latency_ms: float, warm_latencies_ms: Iterable[float]) -> Dict[str, Any]:
     warm = [float(v) for v in warm_latencies_ms]
     warm_mean = float(statistics.mean(warm)) if warm else 0.0
@@ -86,6 +168,33 @@ def build_remote_instructions(
         "collect_profile": f"python -m jax.collect_profile {profiler_port} 3000 --log_dir={DEFAULT_LOGDIR / DEFAULT_XPROF_SUBDIR} --no_perfetto_link",
         "xprof_url": f"http://localhost:{xprof_port}/",
     }
+
+
+def collect_device_metadata() -> Dict[str, Any]:
+    """Collect JAX device and platform information for the profiling report.
+
+    Returns a dict with platform, device kind, count, JAX version, and
+    per-device details.  Returns a minimal fallback dict if JAX is
+    unavailable or device enumeration fails.
+    """
+    try:
+        jax = _import_jax()
+        devices = jax.devices()
+        if not devices:
+            return {"platform": "cpu", "device_count": 0, "jax_version": str(getattr(jax, "__version__", "unknown"))}
+        first = devices[0]
+        return {
+            "platform": str(first.platform),
+            "device_kind": str(getattr(first, "device_kind", "unknown")),
+            "device_count": len(devices),
+            "devices": [
+                {"id": d.id, "platform": str(d.platform), "device_kind": str(getattr(d, "device_kind", "unknown"))}
+                for d in devices
+            ],
+            "jax_version": str(getattr(jax, "__version__", "unknown")),
+        }
+    except Exception:
+        return {"platform": "unavailable", "device_count": 0}
 
 
 def heuristic_diagnosis(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -149,6 +258,41 @@ def heuristic_diagnosis(summary: Dict[str, Any]) -> Dict[str, Any]:
             "Capture a warm execution trace with Perfetto/XProf.",
             "Compare baseline JAX against an XLA-friendly rewrite before attempting Pallas.",
         ],
+    }
+
+
+def compare_summaries(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare two profiling summaries and return a structured delta report.
+
+    Useful for agent workflows: profile -> optimise -> re-profile -> compare.
+    Positive *_delta_pct values mean the metric *increased* (usually bad for
+    latency).  The ``verdict`` field gives a one-word agent-friendly label.
+    """
+    def _delta(key: str) -> Dict[str, Any]:
+        b = float(baseline.get(key, 0.0))
+        c = float(current.get(key, 0.0))
+        abs_delta = round(c - b, 3)
+        pct_delta = round((c - b) / b * 100.0, 2) if b != 0 else 0.0
+        return {"baseline": round(b, 3), "current": round(c, 3), "delta": abs_delta, "delta_pct": pct_delta}
+
+    warm_d = _delta("warm_latency_ms_p50")
+    cold_d = _delta("cold_latency_ms")
+    compile_d = _delta("compile_overhead_ms")
+
+    # Verdict: improved / regressed / neutral (5% threshold)
+    p50_pct = warm_d["delta_pct"]
+    if p50_pct <= -5.0:
+        verdict = "improved"
+    elif p50_pct >= 5.0:
+        verdict = "regressed"
+    else:
+        verdict = "neutral"
+
+    return {
+        "warm_latency_ms_p50": warm_d,
+        "cold_latency_ms": cold_d,
+        "compile_overhead_ms": compile_d,
+        "verdict": verdict,
     }
 
 
@@ -273,6 +417,13 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
             xprof_port=args.xprof_port,
             profiler_port=args.profiler_port,
         )
+
+    # Collect device metadata (best-effort, non-blocking).
+    if not args.dry_run:
+        try:
+            result["device_metadata"] = collect_device_metadata()
+        except Exception:
+            pass
 
     if args.dry_run:
         result.update(summarize_timings(0.0, []))

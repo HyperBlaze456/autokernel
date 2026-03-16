@@ -211,6 +211,167 @@ class ProfileJaxTests(unittest.TestCase):
         artifacts = self.mod._collect_trace_artifacts(pathlib.Path("/nonexistent/dir"))
         self.assertEqual(artifacts, [])
 
+    # --- RegionTracker tests ---
+
+    def test_region_tracker_record_and_summarize(self):
+        tracker = self.mod.RegionTracker()
+        tracker.record("attention", 50.0)
+        tracker.record("ffn", 30.0)
+        tracker.record("layernorm", 20.0)
+        summary = tracker.summarize()
+        self.assertEqual(len(summary), 3)
+        # Sorted by elapsed_ms descending
+        self.assertEqual(summary[0]["name"], "attention")
+        self.assertEqual(summary[1]["name"], "ffn")
+        self.assertEqual(summary[2]["name"], "layernorm")
+        # Percentages should sum to 100
+        total_pct = sum(r["pct"] for r in summary)
+        self.assertAlmostEqual(total_pct, 100.0, places=1)
+        self.assertAlmostEqual(summary[0]["pct"], 50.0)
+
+    def test_region_tracker_with_metadata(self):
+        tracker = self.mod.RegionTracker()
+        tracker.record("matmul", 100.0, device="tpu", flops=1e12)
+        summary = tracker.summarize()
+        self.assertEqual(summary[0]["device"], "tpu")
+        self.assertEqual(summary[0]["flops"], 1e12)
+
+    def test_region_tracker_reset(self):
+        tracker = self.mod.RegionTracker()
+        tracker.record("op", 10.0)
+        self.assertEqual(len(tracker.summarize()), 1)
+        tracker.reset()
+        self.assertEqual(len(tracker.summarize()), 0)
+
+    def test_region_tracker_empty_summarize(self):
+        tracker = self.mod.RegionTracker()
+        self.assertEqual(tracker.summarize(), [])
+
+    def test_region_tracker_single_region_is_100_pct(self):
+        tracker = self.mod.RegionTracker()
+        tracker.record("only_op", 42.0)
+        summary = tracker.summarize()
+        self.assertAlmostEqual(summary[0]["pct"], 100.0)
+
+    # --- TraceRegion tests ---
+
+    def test_trace_region_records_elapsed_time(self):
+        region = self.mod.TraceRegion("test_op")
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            with region:
+                import time as _t
+                _t.sleep(0.01)  # 10ms
+        self.assertGreater(region.elapsed_ms, 5.0)  # at least 5ms
+
+    def test_trace_region_with_tracker(self):
+        tracker = self.mod.RegionTracker()
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            with self.mod.TraceRegion("op1", tracker=tracker):
+                pass
+            with self.mod.TraceRegion("op2", tracker=tracker):
+                pass
+        summary = tracker.summarize()
+        self.assertEqual(len(summary), 2)
+        names = {r["name"] for r in summary}
+        self.assertEqual(names, {"op1", "op2"})
+
+    def test_trace_region_convenience_via_tracker(self):
+        tracker = self.mod.RegionTracker()
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            with tracker.region("conv"):
+                pass
+        self.assertEqual(len(tracker.summarize()), 1)
+        self.assertEqual(tracker.summarize()[0]["name"], "conv")
+
+    def test_trace_region_metadata_passes_through(self):
+        tracker = self.mod.RegionTracker()
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            with self.mod.TraceRegion("op", tracker=tracker, layer=3, kind="fwd"):
+                pass
+        entry = tracker.summarize()[0]
+        self.assertEqual(entry["layer"], 3)
+        self.assertEqual(entry["kind"], "fwd")
+
+    def test_trace_region_works_without_jax(self):
+        """TraceRegion should not raise even if JAX is missing."""
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            with self.mod.TraceRegion("safe_op") as r:
+                pass
+        self.assertGreaterEqual(r.elapsed_ms, 0.0)
+
+    # --- collect_device_metadata tests ---
+
+    def test_collect_device_metadata_with_devices(self):
+        fake_device = mock.MagicMock()
+        fake_device.platform = "tpu"
+        fake_device.device_kind = "TPU v4"
+        fake_device.id = 0
+
+        fake_jax = mock.MagicMock()
+        fake_jax.devices.return_value = [fake_device]
+        fake_jax.__version__ = "0.5.1"
+
+        with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax):
+            meta = self.mod.collect_device_metadata()
+
+        self.assertEqual(meta["platform"], "tpu")
+        self.assertEqual(meta["device_kind"], "TPU v4")
+        self.assertEqual(meta["device_count"], 1)
+        self.assertEqual(meta["jax_version"], "0.5.1")
+        self.assertEqual(len(meta["devices"]), 1)
+
+    def test_collect_device_metadata_no_jax(self):
+        with mock.patch.object(self.mod, "_import_jax", side_effect=RuntimeError("no jax")):
+            meta = self.mod.collect_device_metadata()
+        self.assertEqual(meta["platform"], "unavailable")
+        self.assertEqual(meta["device_count"], 0)
+
+    def test_collect_device_metadata_empty_devices(self):
+        fake_jax = mock.MagicMock()
+        fake_jax.devices.return_value = []
+        fake_jax.__version__ = "0.5.0"
+
+        with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax):
+            meta = self.mod.collect_device_metadata()
+        self.assertEqual(meta["platform"], "cpu")
+        self.assertEqual(meta["device_count"], 0)
+
+    # --- compare_summaries tests ---
+
+    def test_compare_summaries_improved(self):
+        baseline = {"warm_latency_ms_p50": 100.0, "cold_latency_ms": 500.0, "compile_overhead_ms": 400.0}
+        current = {"warm_latency_ms_p50": 80.0, "cold_latency_ms": 450.0, "compile_overhead_ms": 370.0}
+        result = self.mod.compare_summaries(baseline, current)
+        self.assertEqual(result["verdict"], "improved")
+        self.assertAlmostEqual(result["warm_latency_ms_p50"]["delta"], -20.0)
+        self.assertAlmostEqual(result["warm_latency_ms_p50"]["delta_pct"], -20.0)
+
+    def test_compare_summaries_regressed(self):
+        baseline = {"warm_latency_ms_p50": 100.0, "cold_latency_ms": 500.0, "compile_overhead_ms": 400.0}
+        current = {"warm_latency_ms_p50": 120.0, "cold_latency_ms": 550.0, "compile_overhead_ms": 430.0}
+        result = self.mod.compare_summaries(baseline, current)
+        self.assertEqual(result["verdict"], "regressed")
+        self.assertAlmostEqual(result["warm_latency_ms_p50"]["delta"], 20.0)
+
+    def test_compare_summaries_neutral(self):
+        baseline = {"warm_latency_ms_p50": 100.0, "cold_latency_ms": 500.0, "compile_overhead_ms": 400.0}
+        current = {"warm_latency_ms_p50": 102.0, "cold_latency_ms": 505.0, "compile_overhead_ms": 403.0}
+        result = self.mod.compare_summaries(baseline, current)
+        self.assertEqual(result["verdict"], "neutral")
+
+    def test_compare_summaries_zero_baseline(self):
+        baseline = {"warm_latency_ms_p50": 0.0, "cold_latency_ms": 0.0, "compile_overhead_ms": 0.0}
+        current = {"warm_latency_ms_p50": 50.0, "cold_latency_ms": 100.0, "compile_overhead_ms": 50.0}
+        result = self.mod.compare_summaries(baseline, current)
+        self.assertEqual(result["warm_latency_ms_p50"]["delta_pct"], 0.0)  # avoid division by zero
+
+    def test_compare_summaries_missing_keys(self):
+        """compare_summaries should handle missing keys gracefully."""
+        result = self.mod.compare_summaries({}, {})
+        self.assertEqual(result["verdict"], "neutral")
+        self.assertAlmostEqual(result["warm_latency_ms_p50"]["baseline"], 0.0)
+        self.assertAlmostEqual(result["warm_latency_ms_p50"]["current"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
