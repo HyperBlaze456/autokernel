@@ -1,21 +1,24 @@
 import importlib.util
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "profile_jax.py"
+# Prefer the new pallas.profiler location; fall back to legacy root shim.
+MODULE_PATH = ROOT / "pallas" / "profiler.py"
+if not MODULE_PATH.exists():
+    MODULE_PATH = ROOT / "profile_jax.py"
 
 
 class ProfileJaxTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("profile_jax", MODULE_PATH)
+        spec = importlib.util.spec_from_file_location("pallas.profiler", MODULE_PATH)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
-        import sys
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         cls.mod = module

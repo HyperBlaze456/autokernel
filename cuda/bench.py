@@ -1217,11 +1217,12 @@ def main():
     kernel_type = args.kernel
 
     try:
-        # Add cwd to path so 'import kernel' works
-        if os.getcwd() not in sys.path:
-            sys.path.insert(0, os.getcwd())
-        # Also add the script's directory
+        # Add project root to path so 'import kernel' works
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        # Also add the cuda directory for 'import reference'
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
 

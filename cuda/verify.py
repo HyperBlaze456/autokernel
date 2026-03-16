@@ -40,7 +40,8 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_DIR = os.path.join(SCRIPT_DIR, "workspace")
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+WORKSPACE_DIR = os.path.join(PROJECT_ROOT, "workspace")
 ORCHESTRATION_STATE = os.path.join(WORKSPACE_DIR, "orchestration_state.json")
 
 # Benchmarking defaults

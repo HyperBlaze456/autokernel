@@ -24,8 +24,10 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_DIR = os.path.join(SCRIPT_DIR, "workspace")
-KERNELS_DIR = os.path.join(SCRIPT_DIR, "kernels")
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+WORKSPACE_DIR = os.path.join(PROJECT_ROOT, "workspace")
+KERNELS_DIR = os.path.join(SCRIPT_DIR, "kernels", "triton")
+KERNELS_CUDA_DIR = os.path.join(SCRIPT_DIR, "kernels", "native")
 DEFAULT_REPORT_PATH = os.path.join(WORKSPACE_DIR, "profile_report.json")
 OPTIMIZATION_PLAN_PATH = os.path.join(WORKSPACE_DIR, "optimization_plan.json")
 
@@ -250,7 +252,7 @@ def read_starter_kernel(op_type: str, backend: str = "triton") -> Optional[str]:
     For backend='cuda':   reads from kernels/cuda/{op_type}.py
     """
     if backend == "cuda":
-        path = os.path.join(KERNELS_DIR, "cuda", f"{op_type}.py")
+        path = os.path.join(KERNELS_CUDA_DIR, f"{op_type}.py")
     else:
         path = os.path.join(KERNELS_DIR, f"{op_type}.py")
     if not os.path.exists(path):

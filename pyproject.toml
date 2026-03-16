@@ -1,46 +1,73 @@
 [project]
 name = "autokernel"
-version = "1.0.0"
-description = "Autonomous AI agents optimizing GPU kernels overnight -- for any PyTorch model"
+version = "2.0.0"
+description = "Autonomous AI agents optimizing GPU/TPU kernels — CUDA/Triton and JAX/Pallas backends"
 readme = "README.md"
 requires-python = ">=3.10"
+# Core: only what the shared orchestrator and analysis tools need.
+# Backend-specific deps (torch, jax) live in optional groups below.
 dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=2.2.0",
     "pandas>=2.2.0",
-    "torch>=2.4.0",
-    "triton>=3.3.0",
 ]
 
 [project.optional-dependencies]
-# Model ingestion: profile and optimize any PyTorch model
+# ---------------------------------------------------------------------------
+# JAX / Pallas backend (pallas/)
+# ---------------------------------------------------------------------------
+# Base: JAX runtime. For TPU, install jax[tpu] instead.
+pallas = [
+    "jax>=0.5.0",
+]
+# XProf + Perfetto tracing for TPU profiling
+pallas-profiling = [
+    "jax>=0.5.0",
+    "xprof>=2.19.0",
+]
+
+# ---------------------------------------------------------------------------
+# CUDA / Triton backend (cuda/)
+# ---------------------------------------------------------------------------
+# Base: PyTorch + Triton JIT
+cuda = [
+    "torch>=2.4.0",
+    "triton>=3.3.0",
+]
+# Native CUDA C++ compilation (speeds up from ~30s to ~5s)
+cuda-native = [
+    "torch>=2.4.0",
+    "triton>=3.3.0",
+    "ninja>=1.11.0",
+]
+# HTA + memory analysis for CUDA profiling
+cuda-profiling = [
+    "torch>=2.4.0",
+    "HolisticTraceAnalysis>=0.2.0",
+]
+
+# ---------------------------------------------------------------------------
+# Shared / cross-backend extras
+# ---------------------------------------------------------------------------
+# HuggingFace model ingestion (requires CUDA backend)
 models = [
     "transformers>=4.50.0",
     "accelerate>=1.5.0",
     "safetensors>=0.5.0",
 ]
-# CUDA C++ backend: native CUDA kernel compilation (speeds up build from ~30s to ~5s)
-cuda = [
-    "ninja>=1.11.0",
-]
-# KernelBench integration: benchmark against 250+ standardized GPU kernel problems
+# KernelBench integration: 250+ standardized GPU kernel problems
 kernelbench = [
     "datasets>=2.16.0",
 ]
-# Advanced profiling: HTA, memory analysis
-profiling = [
-    "HolisticTraceAnalysis>=0.2.0",
-]
-# JAX/TPU profiling: Perfetto + XProf oriented workflow for TPU/Pallas research
-jax-profiling = [
-    "jax>=0.5.0",
-    "xprof>=2.19.0",
-]
-# HuggingFace Kernels: export and distribute optimized kernels via the Hub
+# Export optimized kernels to HuggingFace Hub
 hf-kernels = [
     "kernels>=0.4.0",
     "huggingface-hub>=0.20.0",
 ]
+
+# Convenience meta-groups
+all-pallas = ["autokernel[pallas,pallas-profiling]"]
+all-cuda = ["autokernel[cuda,cuda-native,cuda-profiling,models,kernelbench]"]
 
 [tool.uv.sources]
 torch = [

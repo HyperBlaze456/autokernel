@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-AutoKernel JAX profiler scaffold.
+AutoKernel JAX profiler scaffold (pallas package).
 
 This is a profiler-first entrypoint for JAX/XLA/Pallas workflows, designed to
 produce agent-friendly profiling artifacts and summaries instead of assuming the
 user should inspect raw traces manually.
+
+This module lives at pallas/profiler.py within the autokernel project.
 
 Current scope:
 - programmatic or server/manual capture modes
@@ -34,7 +36,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-DEFAULT_LOGDIR = SCRIPT_DIR / "workspace" / "jax_profile"
+DEFAULT_LOGDIR = SCRIPT_DIR.parent / "workspace" / "jax_profile"
 DEFAULT_TRACE_SUBDIR = "trace"
 DEFAULT_XPROF_SUBDIR = "xprof"
 DEFAULT_PROFILER_PORT = 9999
@@ -536,7 +538,7 @@ def _import_jax():
         return jax
     except ImportError as exc:
         raise RuntimeError(
-            "JAX is not installed. Install the optional JAX profiling dependencies before using profile_jax.py."
+            "JAX is not installed. Install the optional JAX profiling dependencies before using pallas/profiler.py."
         ) from exc
 
 

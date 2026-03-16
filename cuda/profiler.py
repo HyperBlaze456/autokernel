@@ -37,7 +37,7 @@ import torch.nn as nn
 WARMUP_ITERS = 5
 PROFILE_ITERS = 10
 
-WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workspace")
 
 # Kernel classification rules: list of (pattern_fragments, op_type)
 # Checked in order; first match wins.
@@ -60,7 +60,7 @@ _SUPPORTED_OP_TYPES: set[str] = set()
 
 def _discover_supported_op_types() -> set[str]:
     """Scan kernels/ directory for supported kernel types."""
-    kernels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+    kernels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "triton")
     supported = set()
     if os.path.isdir(kernels_dir):
         for fname in os.listdir(kernels_dir):
