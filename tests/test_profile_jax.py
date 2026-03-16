@@ -372,6 +372,189 @@ class ProfileJaxTests(unittest.TestCase):
         self.assertAlmostEqual(result["warm_latency_ms_p50"]["baseline"], 0.0)
         self.assertAlmostEqual(result["warm_latency_ms_p50"]["current"], 0.0)
 
+    # --- build_remote_instructions logdir tests ---
+
+    def test_build_remote_instructions_uses_custom_logdir(self):
+        """build_remote_instructions should use provided logdir, not DEFAULT_LOGDIR."""
+        custom_logdir = pathlib.Path("/custom/profile_output")
+        instructions = self.mod.build_remote_instructions(host="tpu-vm", logdir=custom_logdir)
+        self.assertIn("/custom/profile_output/xprof", instructions["collect_profile"])
+        self.assertNotIn("workspace/jax_profile", instructions["collect_profile"])
+
+    def test_build_remote_instructions_default_logdir_when_none(self):
+        """build_remote_instructions should fall back to DEFAULT_LOGDIR when logdir is None."""
+        instructions = self.mod.build_remote_instructions(host="tpu-vm")
+        self.assertIn("workspace/jax_profile", instructions["collect_profile"])
+
+    # --- run_profile integration tests ---
+
+    def test_run_profile_dry_run(self):
+        """Dry run returns metadata without executing the target function."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "4,128",
+                "--dry-run",
+                "--logdir", tmpdir,
+            ])
+            result = self.mod.run_profile(args)
+
+        self.assertEqual(result["mode"], "both")
+        self.assertEqual(result["capture"], "programmatic")
+        self.assertEqual(result["input_shape"], [4, 128])
+        self.assertIn("diagnosis", result)
+        self.assertAlmostEqual(result["cold_latency_ms"], 0.0)
+        self.assertEqual(result["measure_iters"], 0)
+
+    def test_run_profile_server_capture(self):
+        """Server capture mode returns instructions, not execution."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "4,128",
+                "--capture", "server",
+                "--logdir", tmpdir,
+            ])
+            result = self.mod.run_profile(args)
+
+        self.assertIn("notes", result)
+        self.assertTrue(any("collect_profile" in n for n in result["notes"]))
+        self.assertIn("diagnosis", result)
+
+    def _make_fake_jax_and_fn(self):
+        """Helper: return a mock jax module and a no-op callable."""
+        fake_profiler = mock.MagicMock()
+        fake_profiler.ProfileOptions.side_effect = AttributeError("not available")
+        fake_jax = mock.MagicMock()
+        fake_jax.profiler = fake_profiler
+        fake_jax.devices.return_value = []
+
+        def fake_fn():
+            return None
+
+        return fake_jax, fake_profiler, fake_fn
+
+    def test_run_profile_mode_perfetto_traces_to_trace_dir(self):
+        """mode=perfetto should trace to trace_dir with create_perfetto_link=True."""
+        fake_jax, fake_profiler, fake_fn = self._make_fake_jax_and_fn()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "2,64",
+                "--mode", "perfetto",
+                "--logdir", tmpdir,
+            ])
+            with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax), \
+                 mock.patch.object(self.mod, "_load_callable", return_value=fake_fn):
+                result = self.mod.run_profile(args)
+
+        call_args = fake_profiler.start_trace.call_args
+        trace_path = call_args[0][0]
+        self.assertTrue(trace_path.endswith("/trace"))
+        self.assertTrue(call_args[1]["create_perfetto_link"])
+        self.assertIn("diagnosis", result)
+
+    def test_run_profile_mode_xprof_traces_to_xprof_dir(self):
+        """mode=xprof should trace to xprof_dir with create_perfetto_link=False."""
+        fake_jax, fake_profiler, fake_fn = self._make_fake_jax_and_fn()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "2,64",
+                "--mode", "xprof",
+                "--logdir", tmpdir,
+            ])
+            with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax), \
+                 mock.patch.object(self.mod, "_load_callable", return_value=fake_fn):
+                result = self.mod.run_profile(args)
+
+        call_args = fake_profiler.start_trace.call_args
+        trace_path = call_args[0][0]
+        self.assertTrue(trace_path.endswith("/xprof"))
+        self.assertFalse(call_args[1]["create_perfetto_link"])
+
+    def test_run_profile_mode_both_traces_to_xprof_dir_with_perfetto(self):
+        """mode=both should trace to xprof_dir with create_perfetto_link=True."""
+        fake_jax, fake_profiler, fake_fn = self._make_fake_jax_and_fn()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "2,64",
+                "--mode", "both",
+                "--logdir", tmpdir,
+            ])
+            with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax), \
+                 mock.patch.object(self.mod, "_load_callable", return_value=fake_fn):
+                result = self.mod.run_profile(args)
+
+        call_args = fake_profiler.start_trace.call_args
+        trace_path = call_args[0][0]
+        self.assertTrue(trace_path.endswith("/xprof"))
+        self.assertTrue(call_args[1]["create_perfetto_link"])
+
+    def test_run_profile_perfetto_link_overrides_xprof_mode(self):
+        """--perfetto-link forces create_perfetto_link=True even in xprof mode."""
+        fake_jax, fake_profiler, fake_fn = self._make_fake_jax_and_fn()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "2,64",
+                "--mode", "xprof",
+                "--perfetto-link",
+                "--logdir", tmpdir,
+            ])
+            with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax), \
+                 mock.patch.object(self.mod, "_load_callable", return_value=fake_fn):
+                result = self.mod.run_profile(args)
+
+        call_args = fake_profiler.start_trace.call_args
+        self.assertTrue(call_args[1]["create_perfetto_link"])
+
+    def test_run_profile_remote_instructions_honor_logdir(self):
+        """Remote instructions in run_profile should use args.logdir, not defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "2,64",
+                "--dry-run",
+                "--logdir", tmpdir,
+                "--remote-host", "tpu-vm",
+                "--remote-user", "alice",
+            ])
+            result = self.mod.run_profile(args)
+
+        instructions = result["remote_instructions"]
+        self.assertIn(tmpdir, instructions["collect_profile"])
+        self.assertNotIn("workspace/jax_profile", instructions["collect_profile"])
+
+    def test_run_profile_programmatic_returns_timings(self):
+        """Programmatic capture should return real timing fields."""
+        fake_jax, fake_profiler, fake_fn = self._make_fake_jax_and_fn()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = self.mod.parse_args([
+                "--module", "fake_module",
+                "--function", "fake_fn",
+                "--input-shape", "8,256",
+                "--warmup-iters", "1",
+                "--measure-iters", "2",
+                "--logdir", tmpdir,
+            ])
+            with mock.patch.object(self.mod, "_import_jax", return_value=fake_jax), \
+                 mock.patch.object(self.mod, "_load_callable", return_value=fake_fn):
+                result = self.mod.run_profile(args)
+
+        self.assertIn("cold_latency_ms", result)
+        self.assertIn("warm_latency_ms_mean", result)
+        self.assertEqual(result["measure_iters"], 2)
+        self.assertIn("diagnosis", result)
+
 
 if __name__ == "__main__":
     unittest.main()

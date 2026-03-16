@@ -160,12 +160,14 @@ def build_remote_instructions(
     perfetto_port: int = DEFAULT_PERFETTO_PORT,
     xprof_port: int = DEFAULT_XPROF_PORT,
     profiler_port: int = DEFAULT_PROFILER_PORT,
+    logdir: Optional[pathlib.Path] = None,
 ) -> Dict[str, str]:
     target = f"{user}@{host}" if user else host
+    xprof_logdir = (logdir or DEFAULT_LOGDIR) / DEFAULT_XPROF_SUBDIR
     return {
         "perfetto_tunnel": f"ssh -L {perfetto_port}:127.0.0.1:{perfetto_port} {target}",
         "xprof_tunnel": f"ssh -L {xprof_port}:127.0.0.1:{xprof_port} {target}",
-        "collect_profile": f"python -m jax.collect_profile {profiler_port} 3000 --log_dir={DEFAULT_LOGDIR / DEFAULT_XPROF_SUBDIR} --no_perfetto_link",
+        "collect_profile": f"python -m jax.collect_profile {profiler_port} 3000 --log_dir={xprof_logdir} --no_perfetto_link",
         "xprof_url": f"http://localhost:{xprof_port}/",
     }
 
@@ -394,8 +396,6 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
     args.logdir.mkdir(parents=True, exist_ok=True)
     trace_dir = args.logdir / DEFAULT_TRACE_SUBDIR
     xprof_dir = args.logdir / DEFAULT_XPROF_SUBDIR
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    xprof_dir.mkdir(parents=True, exist_ok=True)
 
     result: Dict[str, Any] = {
         "runtime": "jax",
@@ -404,8 +404,6 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
         "input_shape": [int(x.strip()) for x in args.input_shape.split(",") if x.strip()],
         "dtype": args.dtype,
         "logdir": str(args.logdir),
-        "trace_dir": str(trace_dir),
-        "xprof_dir": str(xprof_dir),
         "annotated_regions": [],
     }
 
@@ -416,6 +414,7 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
             perfetto_port=args.perfetto_port,
             xprof_port=args.xprof_port,
             profiler_port=args.profiler_port,
+            logdir=args.logdir,
         )
 
     # Collect device metadata (best-effort, non-blocking).
@@ -430,8 +429,6 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
         result["diagnosis"] = heuristic_diagnosis(result)
         return result
 
-    fn = _load_callable(args)
-
     if args.capture == "server":
         result.update(summarize_timings(0.0, []))
         result["notes"] = [
@@ -441,30 +438,49 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
         result["diagnosis"] = heuristic_diagnosis(result)
         return result
 
+    fn = _load_callable(args)
     jax = _import_jax()
     profiler = jax.profiler
 
-    if args.mode in {"perfetto", "both", "xprof"}:
+    # Determine trace output directory and perfetto link based on --mode.
+    # JAX's start_trace always produces XPlane protos (viewable in TensorBoard /
+    # XProf); create_perfetto_link additionally uploads to ui.perfetto.dev.
+    if args.mode == "perfetto":
+        active_trace_dir = trace_dir
+        create_perfetto_link = True
+    elif args.mode == "xprof":
+        active_trace_dir = xprof_dir
+        create_perfetto_link = False
+    else:  # both
+        active_trace_dir = xprof_dir
+        create_perfetto_link = True
+    # --perfetto-link flag can force link creation in any mode.
+    if args.perfetto_link:
+        create_perfetto_link = True
+
+    active_trace_dir.mkdir(parents=True, exist_ok=True)
+    result["output_dir"] = str(active_trace_dir)
+
+    options = None
+    try:
+        options = profiler.ProfileOptions()
+        options.python_tracer_level = 0
+        options.host_tracer_level = 2
+        options.device_tracer_level = 1
+    except Exception:
         options = None
-        try:
-            options = profiler.ProfileOptions()
-            options.python_tracer_level = 0
-            options.host_tracer_level = 2
-            options.device_tracer_level = 1
-        except Exception:
-            options = None
 
-        profiler.start_trace(str(xprof_dir), create_perfetto_link=bool(args.perfetto_link), profiler_options=options)
-        try:
-            timings = _run_timed_callable(lambda: fn(), args.measure_iters, args.warmup_iters)
-        finally:
-            profiler.stop_trace()
-        result.update(timings)
+    profiler.start_trace(str(active_trace_dir), create_perfetto_link=create_perfetto_link, profiler_options=options)
+    try:
+        timings = _run_timed_callable(lambda: fn(), args.measure_iters, args.warmup_iters)
+    finally:
+        profiler.stop_trace()
+    result.update(timings)
 
-        # Collect trace artifacts for CI/remote consumption (non-blocking).
-        artifacts = _collect_trace_artifacts(xprof_dir)
-        if artifacts:
-            result["trace_artifacts"] = artifacts
+    # Collect trace artifacts for CI/remote consumption (non-blocking).
+    artifacts = _collect_trace_artifacts(active_trace_dir)
+    if artifacts:
+        result["trace_artifacts"] = artifacts
 
     result["diagnosis"] = heuristic_diagnosis(result)
     return result
