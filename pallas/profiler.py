@@ -34,6 +34,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+try:
+    import tpu_vm
+except Exception:  # pragma: no cover - optional during bootstrap
+    tpu_vm = None
+
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_LOGDIR = SCRIPT_DIR.parent / "workspace" / "jax_profile"
@@ -516,6 +521,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--remote-user", type=str, default=None)
     parser.add_argument("--perfetto-link", action="store_true", default=False, help="Request Perfetto link creation when supported.")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Emit metadata/instructions without executing the target function.")
+    if tpu_vm is not None:
+        tpu_vm.add_remote_tpu_arguments(parser, default_sync_mode="repo", default_local_root=str(SCRIPT_DIR))
     return parser.parse_args(argv)
 
 
@@ -682,8 +689,49 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
     return result
 
 
+def build_profile_cli_args(args: argparse.Namespace) -> List[str]:
+    forwarded: List[str] = []
+    if args.script:
+        forwarded.extend(["--script", args.script])
+    if args.module:
+        forwarded.extend(["--module", args.module])
+    forwarded.extend(["--function", args.function, "--input-shape", args.input_shape])
+    if args.dtype != "bfloat16":
+        forwarded.extend(["--dtype", args.dtype])
+    if args.capture != "programmatic":
+        forwarded.extend(["--capture", args.capture])
+    if args.mode != "both":
+        forwarded.extend(["--mode", args.mode])
+    if pathlib.Path(args.logdir) != DEFAULT_LOGDIR:
+        forwarded.extend(["--logdir", str(args.logdir)])
+    if args.warmup_iters != DEFAULT_WARMUP_ITERS:
+        forwarded.extend(["--warmup-iters", str(args.warmup_iters)])
+    if args.measure_iters != DEFAULT_MEASURE_ITERS:
+        forwarded.extend(["--measure-iters", str(args.measure_iters)])
+    if args.profiler_port != DEFAULT_PROFILER_PORT:
+        forwarded.extend(["--profiler-port", str(args.profiler_port)])
+    if args.perfetto_port != DEFAULT_PERFETTO_PORT:
+        forwarded.extend(["--perfetto-port", str(args.perfetto_port)])
+    if args.xprof_port != DEFAULT_XPROF_PORT:
+        forwarded.extend(["--xprof-port", str(args.xprof_port)])
+    if args.remote_host:
+        forwarded.extend(["--remote-host", args.remote_host])
+    if args.remote_user:
+        forwarded.extend(["--remote-user", args.remote_user])
+    if args.perfetto_link:
+        forwarded.append("--perfetto-link")
+    if args.dry_run:
+        forwarded.append("--dry-run")
+    return forwarded
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "remote_tpu", False):
+        if tpu_vm is None:
+            print("ERROR: remote TPU support is unavailable because tpu_vm.py could not be imported.")
+            return 1
+        return tpu_vm.delegate_profile_jax_from_namespace(args, build_profile_cli_args(args))
     try:
         result = run_profile(args)
     except Exception as exc:

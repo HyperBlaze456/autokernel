@@ -63,6 +63,29 @@ class ProfileJaxTests(unittest.TestCase):
         self.assertIn("ssh -L 9001:127.0.0.1:9001 alice@tpu-vm", instructions["perfetto_tunnel"])
         self.assertIn("ssh -L 8791:127.0.0.1:8791 alice@tpu-vm", instructions["xprof_tunnel"])
 
+    def test_build_profile_cli_args_omits_default_values(self):
+        args = self.mod.parse_args([
+            "--module", "mypkg.model",
+            "--function", "run_step",
+            "--input-shape", "1,2048",
+        ])
+        forwarded = self.mod.build_profile_cli_args(args)
+        self.assertEqual(forwarded, ["--module", "mypkg.model", "--function", "run_step", "--input-shape", "1,2048"])
+
+    def test_main_remote_tpu_delegates_to_tpu_vm(self):
+        with mock.patch.object(self.mod.tpu_vm, "delegate_profile_jax_from_namespace", return_value=0) as delegate_mock:
+            code = self.mod.main([
+                "--module", "mypkg.model",
+                "--function", "run_step",
+                "--input-shape", "1,2048",
+                "--remote-tpu",
+                "--tpu-project", "demo-project",
+            ])
+        self.assertEqual(code, 0)
+        delegate_mock.assert_called_once()
+        delegated_args = delegate_mock.call_args.args[1]
+        self.assertEqual(delegated_args, ["--module", "mypkg.model", "--function", "run_step", "--input-shape", "1,2048"])
+
     def test_heuristic_diagnosis_prefers_xla_rewrite_when_compile_dominates(self):
         diagnosis = self.mod.heuristic_diagnosis({
             "cold_latency_ms": 1500.0,

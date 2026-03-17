@@ -153,6 +153,71 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 | `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
 | `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
 
+## Remote TPU VM Testing
+
+For JAX/Pallas and TPU-hosted work, AutoKernel ships a repo-specific TPU manager:
+
+- `tpu_vm.py`
+
+It is a Python rewrite of the TPU spot/watchdog shell workflow, adapted for this repository rather than the original Docker/vLLM setup. The manager can:
+
+1. create / inspect / delete a spot TPU queued resource
+2. bootstrap a TPU-friendly Python environment on the VM
+3. sync the current local AutoKernel repo snapshot to the TPU checkout
+4. run TPU-oriented tests remotely
+5. run `profile_jax.py` remotely
+6. watch for preemption and recreate + re-setup automatically
+
+It uses the same environment variables and naming conventions as the original shell scripts:
+
+- `TPU_NAME`
+- `TPU_PROJECT`
+- `TPU_ZONE`
+- `TPU_WORKER`
+- `TPU_REMOTE_ROOT`
+- `TPU_ACCELERATOR`
+- `TPU_RUNTIME`
+- `TPU_SERVICE_ACCOUNT`
+
+Examples:
+
+```bash
+# Create the spot TPU and wait for it to become ACTIVE
+python tpu_vm.py --project my-project create
+
+# Bootstrap the repo checkout + TPU python env (.venv-tpu) on the VM
+python tpu_vm.py --project my-project setup
+
+# Sync the current local repo snapshot to /root/autokernel on the TPU VM
+python tpu_vm.py --project my-project sync-repo
+
+# Run the TPU-focused test targets remotely
+python tpu_vm.py --project my-project test
+
+# Run the JAX profiler remotely
+python tpu_vm.py --project my-project profile-jax \
+  --profile-args "--module my_pkg.model --function run_step --input-shape 1,2048"
+
+# Open an interactive shell on worker 0
+python tpu_vm.py --project my-project ssh
+
+# Full create -> setup -> watch loop with automatic recovery
+python tpu_vm.py --project my-project watchdog
+```
+
+`profile_jax.py` can also delegate into the same flow directly:
+
+```bash
+python profile_jax.py \
+  --module my_pkg.model \
+  --function run_step \
+  --input-shape 1,2048 \
+  --remote-tpu \
+  --tpu-project my-project
+```
+
+This makes the TPU manager the stable entrypoint for remote tests and benchmarking, instead of relying on ad-hoc bash scripts.
+
 ## HuggingFace Kernels Export
 
 Export optimized kernels to the [HuggingFace Hub](https://huggingface.co/docs/kernels/en/index)
