@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import io
+import json as _json_mod
 import math
 import os
 import pathlib
@@ -175,6 +177,26 @@ def gen_reduce_inputs(size: dict, dtype: Any, seed: int = 42) -> dict:
     return {"x": x}
 
 
+def gen_gated_delta_attention_inputs(size: dict, dtype: Any, seed: int = 42) -> dict:
+    jax, jnp, _ = _import_jax()
+    k1, k2, k3, k4, k5 = jax.random.split(_key(seed), 5)
+    batch, heads, seq_len, head_dim = size["batch"], size["heads"], size["seq_len"], size["head_dim"]
+    # L2-normalize q, k for numerical stability (matches FLA use_qk_l2norm_in_kernel)
+    q = jax.random.normal(k1, (batch, seq_len, heads, head_dim), dtype=jnp.float32)
+    q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
+    k = jax.random.normal(k2, (batch, seq_len, heads, head_dim), dtype=jnp.float32)
+    k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+    v = jax.random.normal(k3, (batch, seq_len, heads, head_dim), dtype=jnp.float32) * 0.1
+    # g: per-head-dim decay factors (log-space, negative for decay)
+    g = -jax.random.uniform(k4, (batch, seq_len, heads, head_dim), dtype=jnp.float32) * 0.1 - 0.05
+    # beta: per-head gating scalar in [0, 1], moderate values
+    beta = jax.nn.sigmoid(jax.random.normal(k5, (batch, seq_len, heads), dtype=jnp.float32) * 0.5)
+    return {
+        "q": q.astype(dtype), "k": k.astype(dtype), "v": v.astype(dtype),
+        "g": g.astype(dtype), "beta": beta.astype(dtype),
+    }
+
+
 # =========================================================================
 # JAX reference implementations
 # =========================================================================
@@ -253,6 +275,45 @@ def _ref_rmsnorm(inputs: dict) -> Any:
 def _ref_reduce(inputs: dict) -> Any:
     _, jnp, _ = _import_jax()
     return jnp.sum(inputs["x"], axis=-1)
+
+
+def _ref_gated_delta_attention(inputs: dict) -> Any:
+    """Gated delta attention (KDA) reference using jax.lax.scan.
+
+    Recurrence per head:
+        S_t = exp(g_t) * S_{t-1} + beta_t * k_t outer (v_t - k_t^T @ S_{t-1})
+        o_t = S_t @ q_t
+    """
+    jax, jnp, _ = _import_jax()
+    q = inputs["q"]       # (B, T, H, D)
+    k = inputs["k"]       # (B, T, H, D)
+    v = inputs["v"]       # (B, T, H, D)
+    g = inputs["g"]       # (B, T, H, D)
+    beta = inputs["beta"] # (B, T, H)
+
+    B, T, H, D = q.shape
+    S0 = jnp.zeros((B, H, D, D), dtype=jnp.float32)
+
+    # Transpose to (T, B, ...) for scan
+    q_t = jnp.transpose(q, (1, 0, 2, 3)).astype(jnp.float32)
+    k_t = jnp.transpose(k, (1, 0, 2, 3)).astype(jnp.float32)
+    v_t = jnp.transpose(v, (1, 0, 2, 3)).astype(jnp.float32)
+    g_t = jnp.transpose(g, (1, 0, 2, 3)).astype(jnp.float32)
+    beta_t = jnp.transpose(beta, (1, 0, 2)).astype(jnp.float32)
+
+    def scan_step(S, inputs):
+        q_i, k_i, v_i, g_i, beta_i = inputs
+        decay = jnp.exp(g_i)
+        S = S * decay[:, :, :, None]
+        retrieval = jnp.einsum('bhk,bhkv->bhv', k_i, S)
+        delta = v_i - retrieval
+        update = jnp.einsum('bhk,bhv->bhkv', k_i, delta) * beta_i[:, :, None, None]
+        S = S + update
+        o_i = jnp.einsum('bhkv,bhk->bhv', S, q_i)
+        return S, o_i
+
+    _, outputs = jax.lax.scan(scan_step, S0, (q_t, k_t, v_t, g_t, beta_t))
+    return jnp.transpose(outputs, (1, 0, 2, 3)).astype(q.dtype)
 
 
 # =========================================================================
@@ -417,6 +478,28 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "bytes_fn": lambda s, dt: (s["M"] * s["N"] + s["M"]) * _dtype_bytes(dt),
         "input_generator": gen_reduce_inputs,
         "reference_fn": _ref_reduce,
+    },
+    "gated_delta_attention": {
+        "test_sizes": [
+            ("small",  {"batch": 2, "heads": 4,  "seq_len": 128,  "head_dim": 64}),
+            ("medium", {"batch": 2, "heads": 8,  "seq_len": 256,  "head_dim": 64}),
+            ("large",  {"batch": 2, "heads": 16, "seq_len": 512,  "head_dim": 64}),
+            ("llm",    {"batch": 1, "heads": 16, "seq_len": 1024, "head_dim": 128}),
+        ],
+        "test_dtypes": ["bfloat16"],
+        "tolerances": {
+            "bfloat16": {"atol": 5e-2, "rtol": 5e-2},
+        },
+        # Per timestep per head: ~4*D*D FLOPs (2 matmuls of DxD + elementwise)
+        # Total: B * H * T * 4 * D * D
+        "flops_fn": lambda s: s["batch"] * s["heads"] * s["seq_len"] * 4 * s["head_dim"] ** 2,
+        "bytes_fn": lambda s, dt: (
+            # q, k, v, g: 4 * B*T*H*D; beta: B*T*H; output: B*T*H*D
+            (5 * s["batch"] * s["seq_len"] * s["heads"] * s["head_dim"]
+             + s["batch"] * s["seq_len"] * s["heads"])
+        ) * _dtype_bytes(dt),
+        "input_generator": gen_gated_delta_attention_inputs,
+        "reference_fn": _ref_gated_delta_attention,
     },
 }
 
@@ -718,11 +801,36 @@ def main() -> int:
                         help="Quick mode: smoke test only, bench large size")
     parser.add_argument("--tpu-gen", type=str, default=None,
                         help="Override TPU generation (e.g. v4, v5e, v6e)")
+    parser.add_argument("--json", action="store_true", default=False,
+                        help="Output results as a single JSON object (suppresses text output)")
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # JSON mode: suppress text output, collect results, emit JSON at end
+    # ------------------------------------------------------------------
+    _json_mode = getattr(args, "json", False)
+    _original_stdout = sys.stdout
+    if _json_mode:
+        sys.stdout = io.StringIO()
 
     print("=" * 60)
     print("AutoKernel JAX/Pallas Benchmark Harness")
     print("=" * 60)
+
+    def _json_error_return(error_msg: str = "", ktype: str = "unknown") -> int:
+        """Emit JSON error output and restore stdout if in --json mode."""
+        if _json_mode:
+            sys.stdout = _original_stdout
+            err_result = {
+                "kernel_type": ktype, "correctness": "FAIL",
+                "throughput_tflops": 0.0, "latency_us": 0.0,
+                "bandwidth_gb_s": 0.0, "pct_peak_compute": 0.0,
+                "pct_peak_bandwidth": 0.0, "bottleneck": "unknown",
+                "peak_vram_mb": 0, "speedup_vs_ref": 0.0,
+                "size_sweep": [], "error": error_msg,
+            }
+            print(_json_mod.dumps(err_result, indent=2))
+        return 1
 
     # ------------------------------------------------------------------
     # Import JAX early so errors surface immediately
@@ -733,7 +841,7 @@ def main() -> int:
         print(f"ERROR: {exc}")
         print("\ncorrectness: FAIL")
         print("throughput_tflops: 0.000")
-        return 1
+        return _json_error_return(str(exc)) if _json_mode else 1
 
     # ------------------------------------------------------------------
     # Load kernel module
@@ -758,7 +866,7 @@ def main() -> int:
                 print("ERROR: kernel.py has no KERNEL_TYPE attribute and --kernel not specified")
                 print("\ncorrectness: FAIL")
                 print("throughput_tflops: 0.000")
-                return 1
+                return _json_error_return("no KERNEL_TYPE") if _json_mode else 1
 
         print(f"kernel_type: {kernel_type}")
         print("kernel_module: kernel.py loaded successfully")
@@ -767,20 +875,20 @@ def main() -> int:
         print(f"\nERROR: kernel.py has a syntax error:\n  {exc}")
         print("\ncorrectness: FAIL")
         print("throughput_tflops: 0.000")
-        return 1
+        return _json_error_return(str(exc)) if _json_mode else 1
     except Exception as exc:
         print(f"\nERROR: Failed to import kernel.py:\n  {type(exc).__name__}: {exc}")
         traceback.print_exc()
         print("\ncorrectness: FAIL")
         print("throughput_tflops: 0.000")
-        return 1
+        return _json_error_return(str(exc)) if _json_mode else 1
 
     if kernel_type not in KERNEL_CONFIGS:
         print(f"\nERROR: Unknown kernel type '{kernel_type}'")
         print(f"  Available: {', '.join(KERNEL_CONFIGS.keys())}")
         print("\ncorrectness: FAIL")
         print("throughput_tflops: 0.000")
-        return 1
+        return _json_error_return(f"unknown kernel type: {kernel_type}", kernel_type) if _json_mode else 1
 
     config = KERNEL_CONFIGS[kernel_type]
 
@@ -902,6 +1010,42 @@ def main() -> int:
 
     elapsed = time.time() - t_start
     print(f"\ntotal_bench_time_s: {elapsed:.1f}")
+
+    # ------------------------------------------------------------------
+    # JSON mode: emit structured JSON to original stdout
+    # ------------------------------------------------------------------
+    if _json_mode:
+        sys.stdout = _original_stdout
+        json_result: Dict[str, Any] = {
+            "kernel_type": kernel_type,
+            "correctness": correctness_results.get("correctness", "FAIL"),
+        }
+        if primary is not None:
+            json_result.update({
+                "throughput_tflops": primary["throughput_tflops"],
+                "latency_us": primary["kernel_latency_us"],
+                "bandwidth_gb_s": primary["bandwidth_gb_s"],
+                "pct_peak_compute": primary["pct_peak_compute"],
+                "pct_peak_bandwidth": primary["pct_peak_bandwidth"],
+                "bottleneck": primary["bottleneck"],
+                "peak_vram_mb": primary["bytes"] / (1024 * 1024),
+                "speedup_vs_ref": primary["speedup_vs_ref"],
+            })
+        else:
+            json_result.update({
+                "throughput_tflops": 0.0,
+                "latency_us": 0.0,
+                "bandwidth_gb_s": 0.0,
+                "pct_peak_compute": 0.0,
+                "pct_peak_bandwidth": 0.0,
+                "bottleneck": "unknown",
+                "peak_vram_mb": 0,
+                "speedup_vs_ref": 0.0,
+            })
+        json_result["size_sweep"] = all_perf
+        json_result["total_bench_time_s"] = elapsed
+        print(_json_mod.dumps(json_result, indent=2, default=str))
+
     return 0
 
 
