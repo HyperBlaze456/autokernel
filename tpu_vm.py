@@ -207,6 +207,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     watchdog_p.add_argument("--failure-threshold", type=int, default=DEFAULT_WATCH_FAILURE_THRESHOLD)
     _add_repo_args(watchdog_p)
 
+    bench_p = sub.add_parser("bench-pallas", help="Run pallas/bench.py remotely and return structured results.")
+    _add_repo_args(bench_p)
+    bench_p.add_argument("--kernel-type", default=None, help="Kernel type to benchmark (forwarded as --kernel to bench.py).")
+    bench_p.add_argument("--bench-args", default="", help="Extra arguments forwarded to pallas/bench.py (e.g. '--quick --sizes large').")
+    bench_p.add_argument("--skip-setup", action="store_true", default=False)
+    bench_p.add_argument("--skip-sync", action="store_true", default=False, help="Skip full repo sync (kernel.py is ALWAYS synced).")
+
     return parser.parse_args(argv)
 
 
@@ -847,6 +854,141 @@ def delegate_profile_jax_from_namespace(args: argparse.Namespace, forwarded_args
     return action_profile_jax(shim, config)
 
 
+# ---------------------------------------------------------------------------
+# Pallas bench output parsing
+# ---------------------------------------------------------------------------
+
+_BENCH_KEY_WHITELIST = frozenset({
+    "correctness",
+    "throughput_tflops",
+    "latency_us",
+    "bandwidth_gb_s",
+    "pct_peak_compute",
+    "pct_peak_bandwidth",
+    "bottleneck",
+    "speedup_vs_ref",
+    "kernel_type",
+    "peak_vram_mb",
+})
+
+_BENCH_STR_KEYS = frozenset({"correctness", "bottleneck", "kernel_type"})
+
+
+def parse_bench_output(stdout: str) -> dict:
+    """Parse pallas/bench.py text output using a strict key whitelist.
+
+    Only keys in _BENCH_KEY_WHITELIST are captured. All other lines are ignored.
+    Last occurrence wins for duplicate keys.
+    """
+    result: dict = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if ": " not in line:
+            continue
+        key, _, value = line.partition(": ")
+        key = key.strip()
+        value = value.strip()
+        if key not in _BENCH_KEY_WHITELIST:
+            continue
+        if key in _BENCH_STR_KEYS:
+            result[key] = value
+        elif key == "speedup_vs_ref":
+            try:
+                result[key] = float(value.rstrip("x"))
+            except ValueError:
+                result[key] = value
+        else:
+            try:
+                result[key] = float(value)
+            except ValueError:
+                result[key] = value
+    return result
+
+
+def _sync_kernel_file(config: TPUVMConfig, local_root: Path, *, dry_run: bool = False) -> int:
+    """Sync only kernel.py to the remote TPU (always, even with --skip-sync)."""
+    kernel_path = local_root / "kernel.py"
+    if not kernel_path.exists():
+        _print_banner("WARNING: kernel.py not found at project root, skipping kernel sync")
+        return 0
+    remote_dest = f"{config.remote_root}/kernel.py"
+    return run_command(
+        build_scp_command(config, str(kernel_path), remote_dest, direction="upload"),
+        dry_run=dry_run,
+    )
+
+
+def run_bench_pallas(
+    args: argparse.Namespace,
+    config: TPUVMConfig,
+    *,
+    bench_args_str: str = "",
+    kernel_type: str | None = None,
+) -> dict:
+    """Run pallas/bench.py remotely and return structured results.
+
+    Always syncs kernel.py to TPU. If --skip-sync is NOT set, also syncs the
+    full repo. Never raises; always returns a result dict.
+
+    Returns: {"exit_code": int, "metrics": dict, "stdout": str, "stderr": str}
+    """
+    options = repo_options_from_namespace(args)
+
+    # Always sync kernel.py, even with --skip-sync
+    skip_sync = getattr(args, "skip_sync", False)
+    skip_setup = getattr(args, "skip_setup", False)
+
+    if not skip_setup:
+        code = action_setup(args, config)
+        if code != 0:
+            return {"exit_code": code, "metrics": {}, "stdout": "", "stderr": "setup failed"}
+
+    if skip_sync:
+        # Only sync kernel.py
+        code = _sync_kernel_file(config, options.local_root, dry_run=args.dry_run)
+        if code != 0:
+            return {"exit_code": code, "metrics": {}, "stdout": "", "stderr": "kernel.py sync failed"}
+    else:
+        code = action_sync_repo(args, config)
+        if code != 0:
+            return {"exit_code": code, "metrics": {}, "stdout": "", "stderr": "repo sync failed"}
+
+    # Build the remote bench command
+    bench_cmd_parts = ["python", "pallas/bench.py"]
+    if kernel_type:
+        bench_cmd_parts.extend(["--kernel", kernel_type])
+    if bench_args_str:
+        bench_cmd_parts.extend(shlex.split(bench_args_str))
+
+    remote_cmd = build_repo_command(config, shell_join(bench_cmd_parts), python_env=options.python_env)
+    exit_code, stdout, stderr = capture_command(
+        build_remote_shell_command(config, remote_cmd), dry_run=args.dry_run
+    )
+
+    metrics = parse_bench_output(stdout)
+    return {"exit_code": exit_code, "metrics": metrics, "stdout": stdout, "stderr": stderr}
+
+
+def action_bench_pallas(args: argparse.Namespace, config: TPUVMConfig) -> int:
+    """Run pallas/bench.py remotely and print structured results."""
+    kernel_type = getattr(args, "kernel_type", None)
+    bench_args_str = getattr(args, "bench_args", "") or ""
+
+    result = run_bench_pallas(args, config, bench_args_str=bench_args_str, kernel_type=kernel_type)
+
+    metrics = result["metrics"]
+    if metrics:
+        _print_banner("Bench results:")
+        for k, v in metrics.items():
+            print(f"  {k}: {v}")
+    else:
+        _print_banner("No metrics parsed from bench output")
+        if result["stderr"]:
+            print(f"  stderr: {result['stderr'][:500]}")
+
+    return result["exit_code"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     config = TPUVMConfig(
@@ -887,6 +1029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return action_watch(args, config)
     if args.action == "watchdog":
         return action_watchdog(args, config)
+    if args.action == "bench-pallas":
+        return action_bench_pallas(args, config)
     raise SystemExit(f"Unknown action: {args.action}")
 
 

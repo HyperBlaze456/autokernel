@@ -78,7 +78,7 @@ RESULT_TSV_HEADER = "\t".join(RESULT_TSV_COLUMNS)
 
 
 def _ensure_workspace() -> None:
-    """Create workspace directories if they do not exist."""
+    """Create workspace directories if they do n exist."""
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -126,6 +126,142 @@ All benchmarks run on TPU v6e (single chip), both paths `@jax.jit` compiled.
 
 **All 22 configurations pass correctness (max error < 0.034).**
 
+## Kernel Architecture
+
+### High-Level Data Flow
+
+```
+Input: q, k, v, g, beta — all (B, T, H, D) / (B, T, H)
+                │
+                ▼
+        ┌───────────────┐
+        │  @jax.jit     │   Single compiled TPU program
+        │  kernel_fn    │   (no Python dispatch overhead)
+        └───────┬───────┘
+                │
+         T ≤ 64?──yes──▶ _kda_naive (sequential scan)
+                │no
+                ▼
+        _kda_chunk_v3c (chunk-based)
+                │
+    ┌───────────┼───────────────────────┐
+    │           │                       │
+    ▼           ▼                       ▼
+ Pad T to    Reshape to chunks      Adaptive C
+ multiple    (B, NC, C, H, D)      C = max(8, T/64)
+ of C        NC ≤ 64 always         power-of-2
+    │           │
+    └─────┬─────┘
+          ▼
+  ┌─── Outer lax.scan (NC iterations) ───┐
+  │                                       │
+  │   process_chunk(S, chunk_data):       │
+  │                                       │
+  │   ┌─────────────────────────────┐     │
+  │   │ 1. Cumulative decay         │     │
+  │   │    g_cum = cumsum(g, C-axis)│     │
+  │   │    exp_g = exp(g_cum)  ←ONE │     │
+  │   └──────────┬──────────────────┘     │
+  │              │                        │
+  │   ┌──────────┴──────────┐             │
+  │   │                     │             │
+  │   ▼                     ▼             │
+  │  Inter-chunk          Intra-chunk     │
+  │  (state→output)       (within-chunk)  │
+  │                                       │
+  │  dq = exp_g * q       k_sc = k/exp_g  │
+  │  out = dq @ S         attn = dq @ k_sc│
+  │  (batched matmul)     attn *= causal   │
+  │                       out = attn @ v   │
+  │   │                     │             │
+  │   └──────────┬──────────┘             │
+  │              │ output = inter + intra │
+  │              │                        │
+  │   ┌──────────┴──────────────────┐     │
+  │   │ State update (inner scan)   │     │
+  │   │ C sequential steps:         │     │
+  │   │                             │     │
+  │   │ for t in 0..C-1:            │     │
+  │   │   kd = k[t] * decay[t]     │     │
+  │   │   ret = kd @ S     ← read  │     │
+  │   │   delta = v[t] - ret        │     │
+  │   │   upd = k[t] ⊗ delta * β   │     │
+  │   │   S = S*decay[t] + upd     │     │
+  │   │         ↑ fused mul-add     │     │
+  │   └─────────────────────────────┘     │
+  │              │                        │
+  │              ▼ S_next (carry)         │
+  └───────────────────────────────────────┘
+          │
+          ▼
+  Reshape (NC,B,C,H,D) → (B,T,H,D)
+          │
+          ▼
+       Output: (B, T, H, D)
+```
+
+### Per-Chunk Operation Count (C=adaptive, D=head_dim)
+
+| Operation | Shape | FLOPs/head | HBM traffic | Notes |
+|-----------|-------|-----------|-------------|-------|
+| cumsum(g) | (B,C,H,D) | C×D | 2×C×D×4B | Along C axis |
+| exp(g_cum) | (B,C,H,D) | C×D | 2×C×D×4B | Single exp for chunk |
+| dq = exp_g * q | (B,C,H,D) | C×D | 2×C×D×4B | Reused as q_scaled |
+| **inter: dq @ S** | **(B,C,H,D)×(B,H,D,D)** | **C×D²** | **(C×D + D²)×4B** | **Batched matmul** |
+| k_scaled = k/exp_g | (B,C,H,D) | C×D | 2×C×D×4B | Division, not exp(-g) |
+| **QK: dq @ k_sc^T** | **(B,H,C,C)** | **C²×D** | **(2×C×D + C²)×4B** | **Parallel attention** |
+| mask + scale | (B,H,C,C) | C² | C²×4B | Causal + beta |
+| **AV: attn @ v** | **(B,C,H,D)** | **C²×D** | **(C² + C×D)×4B** | **Parallel output** |
+| exp(g_blk) | (B,C,H,D) | C×D | 2×C×D×4B | Precomputed for scan |
+| **State scan** | **C steps** | **C×(2D²+D)** | **C×(2D²+2D)×4B** | **Sequential** |
+
+**Dominant cost:** State scan (C×2D² FLOPs, C×2D² HBM) — inherently sequential.
+**Speedup source:** Inter/intra replace C sequential output reads with 3 parallel matmuls.
+
+### Memory Layout Strategy
+
+```
+Input layout:  (B, T, H, D) — "BTHD" natural layout
+Chunk layout:  (B, NC, C, H, D) → (NC, B, C, H, D) for outer scan
+Intra-chunk:   BCHD-native einsums (no transpose for q, k, v)
+                 einsum('bihd,bjhd->bhij', ...) — H treated as batch in middle
+State:         (B, H, D, D) — contiguous per-head for matmul
+Inner scan:    (C, B, H, D) — step dimension first for lax.scan
+```
+
+**Key insight:** XLA generates better TPU code for BCHD einsum patterns than
+explicit BHCD layout. The transposes serve as layout hints that help XLA's
+layout assignment pass — removing them (V4 attempt) was *slower*.
+
+### Adaptive Chunk Size
+
+```
+C = max(8, next_power_of_2(T / 64))
+
+T=128   → C=8    NC=16    (small, below scan cliff)
+T=512   → C=8    NC=64    (at cliff boundary)
+T=1024  → C=16   NC=64
+T=2048  → C=32   NC=64
+T=4096  → C=64   NC=64
+T=8192  → C=128  NC=64
+T=16384 → C=256  NC=64
+T=32768 → C=512  NC=64
+```
+
+NC is always ≤ 64 to avoid the XLA scan compilation cliff.
+Power-of-2 alignment ensures clean TPU tile boundaries.
+
+### Files
+
+```
+kernel.py                                  — Production kernel (@jax.jit, hybrid dispatch)
+pallas/kernels/gated_delta_attention.py    — Starter/reference copy (same as kernel.py)
+pallas/kernels/gated_delta_attention_naive.py — Naive scan baseline
+pallas/kernels/gated_delta_attention_assoc.py — Associative scan variant (experimental)
+pallas/models/kimi_linear.py               — Full Kimi Linear model with KDA layer
+pallas/bench.py                            — Benchmark framework with KDA support
+```
+
 ## Key Optimizations
 
 | # | Optimization | Impact | Phase |
